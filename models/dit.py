@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
+
+if TYPE_CHECKING:
+    from .cache import KVCache
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +27,7 @@ LATENT_H = 8
 LATENT_W = 8
 NUM_PATCHES = (LATENT_H // PATCH_SIZE) * (LATENT_W // PATCH_SIZE)  # 16
 PATCH_DIM = IN_CHANNELS * PATCH_SIZE * PATCH_SIZE  # 64
+MAX_CTX_FRAMES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +154,58 @@ class DiTBlock(nn.Module):
 
             return x
 
+    def _adaln_qkv(self, x: torch.Tensor, c: torch.Tensor):
+        """Shared adaLN + QKV projection for prefill/cached paths."""
+        B, N, D = x.shape
+        mod = self.adaLN_modulation(c)
+        shift1, scale1, gate1, shift2, scale2, gate2 = mod.chunk(6, dim=-1)
+        x_norm = modulate(self.norm1(x), shift1, scale1)
+        qkv = self.qkv(x_norm)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+        k = k.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+        v = v.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+        return q, k, v, shift1, scale1, gate1, shift2, scale2, gate2
+
+    def forward_prefill(
+        self, x_ctx: torch.Tensor, c_ctx: torch.Tensor, cache: KVCache, layer_idx: int
+    ) -> torch.Tensor:
+        """Prefill: self-attention among context tokens only, caches K/V."""
+        with record_function("DiTBlock.forward_prefill"):
+            B, N, D = x_ctx.shape
+            q, k, v, _, _, gate1, shift2, scale2, gate2 = self._adaln_qkv(x_ctx, c_ctx)
+
+            cache.prefill(layer_idx, k, v)
+
+            attn = F.scaled_dot_product_attention(q, k, v)
+            attn = attn.transpose(1, 2).reshape(B, N, D)
+            attn = self.proj(attn)
+            x_ctx = x_ctx + gate1.unsqueeze(1) * attn
+
+            x_norm2 = modulate(self.norm2(x_ctx), shift2, scale2)
+            x_ctx = x_ctx + gate2.unsqueeze(1) * self.mlp(x_norm2)
+            return x_ctx
+
+    def forward_cached(
+        self, x_den: torch.Tensor, c_den: torch.Tensor, cache: KVCache, layer_idx: int
+    ) -> torch.Tensor:
+        """Cached: Q from denoise tokens attends to full cached K/V."""
+        with record_function("DiTBlock.forward_cached"):
+            B, N, D = x_den.shape
+            q, k, v, _, _, gate1, shift2, scale2, gate2 = self._adaln_qkv(x_den, c_den)
+
+            cache.update(layer_idx, k, v)
+            k_full, v_full = cache.get_kv(layer_idx)
+
+            attn = F.scaled_dot_product_attention(q, k_full, v_full)
+            attn = attn.transpose(1, 2).reshape(B, N, D)
+            attn = self.proj(attn)
+            x_den = x_den + gate1.unsqueeze(1) * attn
+
+            x_norm2 = modulate(self.norm2(x_den), shift2, scale2)
+            x_den = x_den + gate2.unsqueeze(1) * self.mlp(x_norm2)
+            return x_den
+
 
 # ---------------------------------------------------------------------------
 # FinalLayer — adaLN + output projection
@@ -184,6 +243,12 @@ class DiTSmall(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, NUM_PATCHES, HIDDEN_DIM))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
+        # Per-frame temporal identity: [1, MAX_CTX_FRAMES+1, 1, HIDDEN_DIM]
+        # Last slot is for the denoise frame.
+        self.frame_pos_embed = nn.Parameter(
+            torch.zeros(1, MAX_CTX_FRAMES + 1, 1, HIDDEN_DIM)
+        )
+
         self.t_embed = TimestepEmbedder()
         self.action_embed = ActionEmbedder()
 
@@ -209,3 +274,70 @@ class DiTSmall(nn.Module):
             x = x.permute(0, 3, 1, 4, 2, 5).reshape(B, IN_CHANNELS, LATENT_H, LATENT_W)
 
             return x  # predicted velocity v_pred
+
+    def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        pH = LATENT_H // PATCH_SIZE
+        pW = LATENT_W // PATCH_SIZE
+        x = x.view(B, pH, pW, IN_CHANNELS, PATCH_SIZE, PATCH_SIZE)
+        return x.permute(0, 3, 1, 4, 2, 5).reshape(B, IN_CHANNELS, LATENT_H, LATENT_W)
+
+    def prefill_cache(
+        self,
+        ctx_latents: torch.Tensor,
+        ctx_actions: torch.Tensor,
+        cache: KVCache,
+    ) -> None:
+        """Prefill KV cache with context frames. Call once before ODE loop.
+
+        Args:
+            ctx_latents: [B, n_ctx_frames, 16, 8, 8] historical latent frames
+            ctx_actions: [B, 8] most recent context action
+            cache: KVCache to fill
+        """
+        with record_function("DiTSmall.prefill_cache"), torch.amp.autocast("cuda", dtype=torch.float16):
+            B, n_ctx, C, H, W = ctx_latents.shape
+
+            # Patch-embed each context frame and add positional embeddings
+            frame_tokens = []
+            for i in range(n_ctx):
+                tok = self.patch_embed(ctx_latents[:, i])  # [B, NUM_PATCHES, HIDDEN_DIM]
+                tok = tok + self.pos_embed + self.frame_pos_embed[:, i, :, :]
+                frame_tokens.append(tok)
+            x_ctx = torch.cat(frame_tokens, dim=1)  # [B, N_ctx, HIDDEN_DIM]
+
+            # Context conditioning: t=1.0 (fully denoised), fixed action
+            t_ones = torch.ones(B, device=x_ctx.device, dtype=x_ctx.dtype)
+            c_ctx = self.t_embed(t_ones) + self.action_embed(ctx_actions)
+
+            for layer_idx, block in enumerate(self.blocks):
+                x_ctx = block.forward_prefill(x_ctx, c_ctx, cache, layer_idx)
+            # x_ctx discarded — we only needed K/V side-effects
+
+    def forward_cached(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        action: torch.Tensor,
+        cache: KVCache,
+    ) -> torch.Tensor:
+        """Forward pass for denoise tokens using cached context K/V.
+
+        Args:
+            x: [B, 16, 8, 8] noisy latent (denoise target)
+            t: [B] timestep
+            action: [B, 8] action conditioning
+            cache: KVCache with prefilled context K/V
+        Returns:
+            [B, 16, 8, 8] predicted velocity
+        """
+        with record_function("DiTSmall.forward_cached"), torch.amp.autocast("cuda", dtype=torch.float16):
+            # Denoise token = last frame slot
+            x = self.patch_embed(x) + self.pos_embed + self.frame_pos_embed[:, -1, :, :]
+            c = self.t_embed(t) + self.action_embed(action)
+
+            for layer_idx, block in enumerate(self.blocks):
+                x = block.forward_cached(x, c, cache, layer_idx)
+
+            x = self.final_layer(x, c)
+            return self._unpatchify(x)
