@@ -1,0 +1,78 @@
+"""HDF5 Trajectory Dataset for DiT training.
+
+Each sample is a (latent_frame, action) pair drawn from stored episodes.
+Supports optional context window for multi-frame conditioning.
+"""
+
+from __future__ import annotations
+
+import h5py
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+class TrajectoryDataset(Dataset):
+    """Reads latent trajectories from HDF5 produced by data/ingest.py.
+
+    HDF5 schema (per episode group):
+        latents: [T, 16, 8, 8] float16
+        actions: [T, action_dim] float32
+
+    Each __getitem__ returns:
+        x_1:    [16, 8, 8]  target latent frame (bfloat16)
+        action: [action_dim] action that produced this frame (bfloat16)
+    """
+
+    def __init__(self, hdf5_path: str, ctx_frames: int = 0) -> None:
+        self.hdf5_path = hdf5_path
+        self.ctx_frames = ctx_frames
+
+        # Build an index: list of (episode_key, timestep) pairs
+        # We skip the first ctx_frames steps so we always have full context
+        self._index: list[tuple[str, int]] = []
+        with h5py.File(hdf5_path, "r") as f:
+            for key in sorted(f.keys()):
+                if key == "metadata":
+                    continue
+                grp = f[key]
+                T = grp["latents"].shape[0]
+                start = max(1, ctx_frames)  # need at least 1 prior frame for action
+                for t in range(start, T):
+                    self._index.append((key, t))
+
+        self._file: h5py.File | None = None
+
+    def _open(self) -> h5py.File:
+        if self._file is None:
+            self._file = h5py.File(self.hdf5_path, "r", rdcc_nbytes=32 * 1024 * 1024)
+        return self._file
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        f = self._open()
+        ep_key, t = self._index[idx]
+        grp = f[ep_key]
+
+        # Target frame
+        x_1 = torch.from_numpy(grp["latents"][t].astype(np.float32))
+        # Action that led to this frame (action at t-1 produces frame at t)
+        action = torch.from_numpy(grp["actions"][t - 1].astype(np.float32))
+
+        result = {"x_1": x_1, "action": action}
+
+        # Optional context frames for cached inference validation
+        if self.ctx_frames > 0:
+            ctx_start = t - self.ctx_frames
+            ctx_latents = torch.from_numpy(
+                grp["latents"][ctx_start:t].astype(np.float32)
+            )
+            result["ctx_latents"] = ctx_latents
+
+        return result
+
+    def __del__(self) -> None:
+        if self._file is not None:
+            self._file.close()
