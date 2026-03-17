@@ -125,7 +125,15 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        cache: KVCache | None = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Unified forward: standard self-attention when cache is None,
+        cached cross-attention (denoise Q → full K/V) when cache is provided."""
         with record_function("DiTBlock"):
             B, N, D = x.shape
 
@@ -142,7 +150,11 @@ class DiTBlock(nn.Module):
             k = k.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
             v = v.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
 
-            attn = F.scaled_dot_product_attention(q, k, v)  # [B, 6, N, 64]
+            if cache is not None:
+                cache.update(layer_idx, k, v)
+                k, v = cache.get_kv(layer_idx)
+
+            attn = F.scaled_dot_product_attention(q, k, v)  # [B, 6, N_kv, 64]
             attn = attn.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
             attn = self.proj(attn)
 
@@ -154,26 +166,23 @@ class DiTBlock(nn.Module):
 
             return x
 
-    def _adaln_qkv(self, x: torch.Tensor, c: torch.Tensor):
-        """Shared adaLN + QKV projection for prefill/cached paths."""
-        B, N, D = x.shape
-        mod = self.adaLN_modulation(c)
-        shift1, scale1, gate1, shift2, scale2, gate2 = mod.chunk(6, dim=-1)
-        x_norm = modulate(self.norm1(x), shift1, scale1)
-        qkv = self.qkv(x_norm)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-        k = k.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-        v = v.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-        return q, k, v, shift1, scale1, gate1, shift2, scale2, gate2
-
     def forward_prefill(
         self, x_ctx: torch.Tensor, c_ctx: torch.Tensor, cache: KVCache, layer_idx: int
     ) -> torch.Tensor:
         """Prefill: self-attention among context tokens only, caches K/V."""
         with record_function("DiTBlock.forward_prefill"):
             B, N, D = x_ctx.shape
-            q, k, v, _, _, gate1, shift2, scale2, gate2 = self._adaln_qkv(x_ctx, c_ctx)
+
+            mod = self.adaLN_modulation(c_ctx)
+            shift1, scale1, gate1, shift2, scale2, gate2 = mod.chunk(6, dim=-1)
+
+            x_norm = modulate(self.norm1(x_ctx), shift1, scale1)
+            qkv = self.qkv(x_norm)
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            q = q.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+            k = k.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+            v = v.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
 
             cache.prefill(layer_idx, k, v)
 
@@ -185,26 +194,6 @@ class DiTBlock(nn.Module):
             x_norm2 = modulate(self.norm2(x_ctx), shift2, scale2)
             x_ctx = x_ctx + gate2.unsqueeze(1) * self.mlp(x_norm2)
             return x_ctx
-
-    def forward_cached(
-        self, x_den: torch.Tensor, c_den: torch.Tensor, cache: KVCache, layer_idx: int
-    ) -> torch.Tensor:
-        """Cached: Q from denoise tokens attends to full cached K/V."""
-        with record_function("DiTBlock.forward_cached"):
-            B, N, D = x_den.shape
-            q, k, v, _, _, gate1, shift2, scale2, gate2 = self._adaln_qkv(x_den, c_den)
-
-            cache.update(layer_idx, k, v)
-            k_full, v_full = cache.get_kv(layer_idx)
-
-            attn = F.scaled_dot_product_attention(q, k_full, v_full)
-            attn = attn.transpose(1, 2).reshape(B, N, D)
-            attn = self.proj(attn)
-            x_den = x_den + gate1.unsqueeze(1) * attn
-
-            x_norm2 = modulate(self.norm2(x_den), shift2, scale2)
-            x_den = x_den + gate2.unsqueeze(1) * self.mlp(x_norm2)
-            return x_den
 
 
 # ---------------------------------------------------------------------------
@@ -255,25 +244,33 @@ class DiTSmall(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock() for _ in range(DEPTH)])
         self.final_layer = FinalLayer()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        with record_function("DiTSmall"):
-            B = x.shape[0]
-            pH = LATENT_H // PATCH_SIZE  # 4
-            pW = LATENT_W // PATCH_SIZE  # 4
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        action: torch.Tensor,
+        cache: KVCache | None = None,
+    ) -> torch.Tensor:
+        """Unified forward pass.
 
+        When *cache* is ``None`` (training / baseline sampling), runs standard
+        self-attention over the denoise tokens only.
+
+        When *cache* is provided (inference with prefilled context), denoise
+        tokens attend to the full [context | denoise] KV stored in the cache.
+        """
+        with record_function("DiTSmall"):
             x = self.patch_embed(x) + self.pos_embed  # [B, 16, 384]
+            if cache is not None:
+                # Denoise frame occupies the last temporal slot
+                x = x + self.frame_pos_embed[:, -1, :, :]
             c = self.t_embed(t) + self.action_embed(action)  # [B, 384]
 
-            for block in self.blocks:
-                x = block(x, c)  # [B, 16, 384]
+            for i, block in enumerate(self.blocks):
+                x = block(x, c, cache=cache, layer_idx=i)
 
             x = self.final_layer(x, c)  # [B, 16, 64]
-
-            # Unpatchify: [B, 16, 64] -> [B, 16, 8, 8]
-            x = x.view(B, pH, pW, IN_CHANNELS, PATCH_SIZE, PATCH_SIZE)
-            x = x.permute(0, 3, 1, 4, 2, 5).reshape(B, IN_CHANNELS, LATENT_H, LATENT_W)
-
-            return x  # predicted velocity v_pred
+            return self._unpatchify(x)  # [B, 16, 8, 8]
 
     def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
@@ -314,6 +311,8 @@ class DiTSmall(nn.Module):
                 x_ctx = block.forward_prefill(x_ctx, c_ctx, cache, layer_idx)
             # x_ctx discarded — we only needed K/V side-effects
 
+    # forward_cached() is now unified into forward(cache=...).
+    # Kept as a thin alias for backward compatibility.
     def forward_cached(
         self,
         x: torch.Tensor,
@@ -321,23 +320,5 @@ class DiTSmall(nn.Module):
         action: torch.Tensor,
         cache: KVCache,
     ) -> torch.Tensor:
-        """Forward pass for denoise tokens using cached context K/V.
-
-        Args:
-            x: [B, 16, 8, 8] noisy latent (denoise target)
-            t: [B] timestep
-            action: [B, 8] action conditioning
-            cache: KVCache with prefilled context K/V
-        Returns:
-            [B, 16, 8, 8] predicted velocity
-        """
-        with record_function("DiTSmall.forward_cached"), torch.amp.autocast("cuda", dtype=torch.float16):
-            # Denoise token = last frame slot
-            x = self.patch_embed(x) + self.pos_embed + self.frame_pos_embed[:, -1, :, :]
-            c = self.t_embed(t) + self.action_embed(action)
-
-            for layer_idx, block in enumerate(self.blocks):
-                x = block.forward_cached(x, c, cache, layer_idx)
-
-            x = self.final_layer(x, c)
-            return self._unpatchify(x)
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            return self.forward(x, t, action, cache=cache)

@@ -50,7 +50,7 @@ def sample_ode_cached(
 
         for i in range(num_steps):
             t_buf.fill_(i * dt)
-            v = model.forward_cached(x, t_buf, action, cache)
+            v = model(x, t_buf, action, cache=cache)
             x.add_(v, alpha=dt)  # inplace: x += dt * v
 
         return x
