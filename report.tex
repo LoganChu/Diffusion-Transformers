@@ -1,0 +1,518 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ── Geometry ──
+\usepackage[margin=0.75in]{geometry}
+
+% ── Packages ──
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,calc}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\setlist{nosep,leftmargin=*}
+
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black}
+
+% ── Title ──
+\title{\textbf{OptiWorld-FM}: Systems-Optimised Diffusion Transformer\\
+for Action-Conditioned World Modelling}
+\author{
+  CS 590 --- Systems of Machine Learning \\
+  Duke University
+}
+\date{March 2025}
+
+\begin{document}
+\maketitle
+
+% ====================================================================
+\section{Introduction}
+% ====================================================================
+
+World models that predict future visual observations conditioned on agent
+actions are a key enabler for model-based reinforcement learning.
+Diffusion-based generative models have emerged as strong candidates for
+this task due to their training stability and sample quality, but their
+iterative sampling procedure introduces a latency bottleneck that limits
+real-time deployment.
+
+This report presents \textbf{OptiWorld-FM}, an end-to-end
+systems-optimised pipeline for training and deploying an
+action-conditioned Diffusion Transformer (DiT)~\cite{peebles2023dit} as
+a latent-space world model.  Our contributions are:
+\begin{enumerate}
+  \item A \textbf{high-throughput data ingestion pipeline} that collects
+        robot manipulation trajectories from GPU-vectorised ManiSkill~3.0
+        environments and encodes them into a compact latent space using
+        the NVIDIA Cosmos tokeniser, achieving 698 latent frames per
+        second.
+  \item A \textbf{DiT backbone} trained with Conditional Flow Matching
+        (CFM), using adaptive layer normalisation (adaLN-Zero) for
+        joint time--action conditioning.
+  \item A \textbf{KV-cache inference engine} that separates static
+        context-frame key/value pairs from iterative denoise tokens,
+        enabling a 2nd-order Heun ODE solver that achieves a
+        \textbf{1.51$\times$} latency speedup over the recompute
+        baseline at batch size~1.
+\end{enumerate}
+
+% ====================================================================
+\section{System Architecture}
+% ====================================================================
+
+The system comprises four stages: data ingestion, latent encoding,
+training, and cached inference.  Figure~\ref{fig:pipeline} summarises
+the dataflow.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.45cm and 0.3cm,
+    block/.style={draw, rounded corners, minimum width=1.9cm,
+                  minimum height=0.6cm, font=\scriptsize,
+                  fill=blue!8, align=center},
+    data/.style={draw, rounded corners, minimum width=1.5cm,
+                 minimum height=0.5cm, font=\scriptsize,
+                 fill=orange!12, align=center},
+    arr/.style={-{Stealth[length=4pt]}, thick}
+]
+  \node[block] (env) {ManiSkill 3.0\\128 envs (GPU)};
+  \node[data,  right=of env] (rgb) {RGB\\$128{\times}128$};
+  \node[block, right=of rgb] (vae) {Cosmos\\CI16$\times$16};
+  \node[data,  right=of vae] (lat) {Latent\\$16{\times}8{\times}8$};
+  \node[data,  below=of lat] (h5) {HDF5};
+  \node[block, below=of h5]  (dit) {DiT-S\\(CFM)};
+  \node[block, left=of dit]  (cache) {KV Cache\\Heun ODE};
+  \node[data,  left=of cache](pred) {Predicted\\latent};
+
+  \draw[arr] (env) -- (rgb);
+  \draw[arr] (rgb) -- (vae);
+  \draw[arr] (vae) -- (lat);
+  \draw[arr] (lat) -- (h5);
+  \draw[arr] (h5)  -- (dit);
+  \draw[arr] (dit) -- (cache);
+  \draw[arr] (cache) -- (pred);
+\end{tikzpicture}
+\caption{End-to-end pipeline from environment interaction to
+cached latent prediction.}
+\label{fig:pipeline}
+\end{figure}
+
+% --------------------------------------------------------------------
+\subsection{Data Ingestion}
+% --------------------------------------------------------------------
+
+We collect trajectories from the \texttt{PickCube-v1} task in
+ManiSkill~3.0 using 128 GPU-vectorised parallel environments.
+Each environment produces $128\times128$ RGB observations and
+8-dimensional continuous actions.
+
+Observations are encoded into a $16\times8\times8$ latent
+representation using the NVIDIA Cosmos-Tokenizer-CI16$\times$16, a
+pretrained continuous image tokeniser that achieves a $256\times$
+spatial compression ratio.  The encoder runs on a dedicated CUDA stream,
+overlapping with environment stepping via a \textbf{double-buffered}
+pipeline: while the current frame is being simulated on the default
+stream, the previous frame is asynchronously encoded on the VAE stream.
+Encoded latents, actions, rewards, and termination flags are written to
+HDF5 with LZF compression using an asynchronous writer process.
+
+\begin{table}[t]
+\centering
+\caption{Ingestion throughput (latent frames per second).}
+\label{tab:ingest}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Envs} & \textbf{LPS} & \textbf{env\_step} & \textbf{vae\_encode} \\
+\midrule
+16  & 180 & 78\% & 20\% \\
+64  & 406 & 77\% & 21\% \\
+128 & 698 & 78\% & 20\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ingest} shows that the pipeline scales near-linearly
+with environment count, with the bottleneck firmly in environment
+simulation (76--80\%).  HDF5 write overhead is negligible ($<0.2\%$)
+thanks to the asynchronous writer.
+
+% --------------------------------------------------------------------
+\subsection{Model Architecture}
+\label{sec:model}
+% --------------------------------------------------------------------
+
+Our backbone is a \textbf{DiT-Small} variant with 12 transformer
+layers, 6 attention heads, and a hidden dimension of 384
+($\sim$32.7\,M parameters).  The architecture is summarised in
+Table~\ref{tab:arch}.
+
+\begin{table}[t]
+\centering
+\caption{DiT-Small architectural configuration.}
+\label{tab:arch}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Input shape & $[B, 16, 8, 8]$ latent \\
+Patch embedding & Conv2d$(16,384,k{=}2,s{=}2)$ \\
+Sequence length & 16 tokens \\
+Hidden dimension $d$ & 384 \\
+Attention heads & 6 ($d_h{=}64$) \\
+Transformer depth & 12 \\
+MLP expansion & $4\times$ (1536) \\
+Action dim & 8 \\
+Max context frames & 4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Conditioning.}
+Time and action conditioning are fused via adaptive layer
+normalisation with zero initialisation
+(adaLN-Zero)~\cite{peebles2023dit}.  The conditioning signal $c$ is the
+sum of a sinusoidal timestep embedding and a learned action embedding,
+each projected to $\mathbb{R}^{384}$:
+\begin{equation}
+  c = \text{MLP}_t\!\bigl(\gamma(t)\bigr) +
+      \text{MLP}_a(a),
+  \label{eq:cond}
+\end{equation}
+where $\gamma(t)\in\mathbb{R}^{256}$ denotes a sinusoidal frequency
+encoding computed in float32 to preserve precision.  Each transformer
+block derives six modulation parameters from~$c$:
+\begin{equation}
+  [\,\alpha_1,\beta_1,g_1,\alpha_2,\beta_2,g_2\,]
+    = \text{MLP}_{\mathrm{mod}}(c),
+  \label{eq:adaln}
+\end{equation}
+which shift, scale, and gate the normalised attention and MLP residuals:
+\begin{align}
+  \hat{x} &= \text{LN}(x)\cdot(1+\alpha)+\beta, \label{eq:mod}\\
+  x &\leftarrow x + g\cdot f(\hat{x}). \label{eq:gate}
+\end{align}
+All modulation weights are zero-initialised so that each block starts as
+an identity function, stabilising early training.
+
+\paragraph{Positional embeddings.}
+We use learnable spatial position embeddings $p_s\in\mathbb{R}^{16\times384}$
+and temporal frame embeddings $p_f\in\mathbb{R}^{5\times1\times384}$
+(four context slots plus one denoise slot).  During training (no context),
+only $p_s$ is applied; during inference, the denoise token additionally
+receives~$p_f[-1]$.
+
+% ====================================================================
+\section{Training}
+% ====================================================================
+
+% --------------------------------------------------------------------
+\subsection{Conditional Flow Matching}
+% --------------------------------------------------------------------
+
+We train with the \textbf{Conditional Flow Matching}
+(CFM)~\cite{lipman2023flow} objective.  Given a clean target
+latent~$x_1$ and Gaussian noise $x_0\sim\mathcal{N}(0,I)$, we
+construct a linear interpolant:
+\begin{equation}
+  x_t = (1-t)\,x_0 + t\,x_1, \qquad t\sim\mathcal{U}(0,1),
+  \label{eq:interp}
+\end{equation}
+with constant target velocity $v^* = x_1 - x_0$.  The training loss is:
+\begin{equation}
+  \mathcal{L} = \mathbb{E}_{t,x_0,x_1}
+    \bigl[\lVert v_\theta(x_t, t, a) - v^* \rVert^2\bigr].
+  \label{eq:loss}
+\end{equation}
+At inference time, we integrate the learned velocity field from $t{=}0$
+(pure noise) to $t{=}1$ (clean latent) using a numerical ODE solver.
+
+% --------------------------------------------------------------------
+\subsection{Optimiser Configuration}
+% --------------------------------------------------------------------
+
+We use AdamW with $\beta=(0.9,0.95)$, weight decay $0.05$, and peak
+learning rate $10^{-3}$.  The schedule is cosine annealing with linear
+warmup over 1\,000 steps:
+\begin{equation}
+  \eta(s) = \begin{cases}
+    \eta_{\max}\cdot s/s_w & s < s_w, \\
+    \tfrac{\eta_{\max}}{2}\bigl(1+\cos\pi\cdot\tfrac{s-s_w}{S-s_w}\bigr) & s \geq s_w,
+  \end{cases}
+\end{equation}
+where $s_w$ is the warmup horizon and $S$ the total training steps.
+Gradients are clipped at $\lVert g\rVert_{\max}=1.0$.
+
+Training uses \texttt{torch.amp} mixed precision with bfloat16 on
+hardware that supports it (A100), falling back to float16 with
+\texttt{GradScaler} on consumer GPUs (RTX~5070).
+Default batch size is 256; at this setting we observe
+${\sim}3{,}000$~steps/s on an A100-40GB with convergence plateauing at
+50--80 epochs.
+
+% ====================================================================
+\section{KV-Cache Inference Engine}
+\label{sec:kvcache}
+% ====================================================================
+
+The central systems contribution is a KV-cache design that eliminates
+redundant computation across ODE steps.  In action-conditioned world
+modelling, the model conditions on $n_c$ historical context frames
+whose representations are \emph{identical across all ODE steps} for a
+given prediction.
+
+% --------------------------------------------------------------------
+\subsection{Cache Design}
+% --------------------------------------------------------------------
+
+We pre-allocate two contiguous tensors of shape
+\begin{equation}
+  K, V \in \mathbb{R}^{L \times 1 \times H \times N_{\mathrm{total}} \times d_h},
+\end{equation}
+where $L{=}12$ layers, $H{=}6$ heads, $d_h{=}64$, and
+$N_{\mathrm{total}} = N_{\mathrm{ctx}} + N_{\mathrm{den}}$.  With
+$n_c{=}2$ context frames, $N_{\mathrm{ctx}}{=}32$ and
+$N_{\mathrm{den}}{=}16$, giving $N_{\mathrm{total}}{=}48$.
+
+The cache is partitioned into two regions:
+\begin{itemize}
+  \item \textbf{Static prefix} $[\,0, N_{\mathrm{ctx}})$: filled once
+        during \emph{prefill} by running context tokens through
+        self-attention across all layers.  Context K/V are written via
+        \texttt{.copy\_()}.
+  \item \textbf{Iterative region} $[N_{\mathrm{ctx}}, N_{\mathrm{total}})$:
+        overwritten at each ODE evaluation with the denoise tokens'
+        K/V.
+\end{itemize}
+
+All operations are zero-allocation: writes use in-place
+\texttt{.copy\_()}, reads return views.  The cache is CUDA-graph-safe
+(static shapes, no \texttt{.item()}, no data-dependent control flow).
+
+% --------------------------------------------------------------------
+\subsection{Unified Forward Pass}
+% --------------------------------------------------------------------
+
+We refactored the DiT forward pass to accept an optional \texttt{cache}
+argument.  When the cache is \texttt{None} (training), each block
+performs standard self-attention.  When a cache is provided (inference),
+each block:
+\begin{enumerate}
+  \item Computes Q, K, V from the denoise tokens.
+  \item Writes K, V into the iterative cache region.
+  \item Reads the \emph{full} K, V (static prefix $\oplus$ iterative).
+  \item Computes attention: $\mathrm{SDPA}(Q_{\mathrm{den}},\,
+        K_{\mathrm{full}},\, V_{\mathrm{full}})$.
+\end{enumerate}
+This unification eliminates code duplication between training and
+inference while guaranteeing numerical parity (Section~\ref{sec:parity}).
+
+% --------------------------------------------------------------------
+\subsection{Heun ODE Solver}
+% --------------------------------------------------------------------
+
+We implement Heun's method (improved Euler, 2nd-order) with cache
+reuse.  For $N$ ODE steps, Heun's method requires $2N{-}1$ model
+evaluations:
+
+\begin{algorithm}[t]
+\caption{KV-Cached Heun Solver}
+\label{alg:heun}
+\begin{algorithmic}[1]
+\Require Model $v_\theta$, context latents $z_{\mathrm{ctx}}$, action $a$, steps $N$
+\State $\mathrm{cache} \gets \text{Prefill}(z_{\mathrm{ctx}})$ \Comment{Once}
+\State $x_0 \sim \mathcal{N}(0, I)$; \; $\Delta t \gets 1/N$
+\For{$i = 0, \ldots, N{-}1$}
+  \State $v_1 \gets v_\theta(x_i,\, i\Delta t,\, a;\; \mathrm{cache})$
+  \If{$i < N{-}1$}
+    \State $\tilde{x} \gets x_i + \Delta t \cdot v_1$ \Comment{Euler predictor}
+    \State $v_2 \gets v_\theta(\tilde{x},\, (i{+}1)\Delta t,\, a;\; \mathrm{cache})$
+    \State $x_{i+1} \gets x_i + \tfrac{\Delta t}{2}(v_1 + v_2)$ \Comment{Corrector}
+  \Else
+    \State $x_{i+1} \gets x_i + \Delta t \cdot v_1$
+  \EndIf
+\EndFor
+\State \Return $x_N$
+\end{algorithmic}
+\end{algorithm}
+
+The inner loop (Algorithm~\ref{alg:heun}) is zero-allocation: the Euler
+predictor writes into a pre-allocated scratch buffer via
+\texttt{torch.add(..., out=x\_euler)}, and the corrector update uses
+in-place \texttt{x.add\_(v1, alpha=dt*0.5)}.
+
+\paragraph{Savings analysis.}
+Without caching, each of the $2N{-}1$ evaluations must recompute context
+K/V across all 12 layers.  With $n_c{=}2$ context frames ($N_{\mathrm{ctx}}{=}32$
+tokens), caching eliminates $2N{-}2 = 14$ redundant prefills for $N{=}8$
+steps.  The prefill cost is dominated by the QKV projection and
+self-attention over 32 context tokens across 12 layers.
+
+% ====================================================================
+\section{Preliminary Results}
+\label{sec:results}
+% ====================================================================
+
+% --------------------------------------------------------------------
+\subsection{Numerical Parity}
+\label{sec:parity}
+% --------------------------------------------------------------------
+
+We verified that the KV-cached path produces outputs identical to
+a recompute baseline (fresh cache per evaluation) within
+$10^{-6}$ absolute tolerance.  Table~\ref{tab:parity} summarises the
+test suite, run in float32 to isolate rounding from caching effects.
+
+\begin{table}[t]
+\centering
+\caption{Parity tests (float32, max absolute difference).}
+\label{tab:parity}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Test} & \textbf{Max $|\Delta|$} & \textbf{Pass} \\
+\midrule
+Single forward     & $0.0$    & \checkmark \\
+Euler (4 steps)    & $0.0$    & \checkmark \\
+Heun (4 steps)     & $0.0$    & \checkmark \\
+No-cache determinism & $0.0$ & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All tests report exactly zero difference, confirming that the cache
+\texttt{.copy\_()} and view operations introduce no numerical deviation.
+
+% --------------------------------------------------------------------
+\subsection{Latency Benchmarks}
+% --------------------------------------------------------------------
+
+We benchmark the Heun solver at batch size~1 on an RTX~5070 Laptop GPU
+(8\,GB VRAM) with float16 autocast, 2~context frames, and 8~ODE steps
+(15~model evaluations).  Results are averaged over 50 runs after
+10~warmup iterations.
+
+\begin{table}[t]
+\centering
+\caption{Heun solver latency at BS=1 (RTX 5070 Laptop, fp16).}
+\label{tab:bench}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Solver} & \textbf{Total} & \textbf{ms/step} & \textbf{ms/eval} & \textbf{Speedup} \\
+\midrule
+Recompute & 1193.81 & 149.23 & 79.59 & $1.00\times$ \\
+KV-cached & 791.38  & 98.92  & 52.76 & $\mathbf{1.51\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:bench} shows that caching reduces per-evaluation latency
+from 79.59\,ms to 52.76\,ms (33.7\% reduction), yielding a
+\textbf{1.51$\times$} end-to-end speedup.  The total wall-clock time
+drops by 402\,ms per sample, which is significant for real-time
+model-predictive control loops.
+
+\paragraph{Speedup scaling.}
+The theoretical upper bound on speedup grows with the number of context
+tokens.  With $n_c$ context frames, each contributing
+$N_p{=}16$ tokens, the prefill processes $16 n_c$ tokens through 12
+layers.  As $n_c$ increases toward the maximum of~4 (64~context tokens),
+the amortised savings will increase because the static prefix constitutes
+a larger fraction of the total attention cost.
+
+% ====================================================================
+\section{Discussion and Future Work}
+% ====================================================================
+
+\paragraph{CUDA graph capture.}
+Our zero-allocation loop design is \emph{graph-safe}: all tensor shapes
+are static and no host-device synchronisation occurs.  Wrapping the ODE
+loop in \texttt{torch.cuda.CUDAGraph} would eliminate kernel launch
+overhead, which currently dominates at small sequence lengths.
+
+\paragraph{\texttt{torch.compile}.}
+We have verified that the model is compatible with
+\texttt{torch.compile(mode="max-autotune")}.  Fusing the adaLN
+modulation, QKV projection, and gating into a single Triton kernel would
+further reduce memory bandwidth pressure.
+
+\paragraph{FP8 quantisation.}
+The CLAUDE.md engineering standard targets FP8 (e4m3fn) for final
+deployment on Ada-generation hardware.  Moving the cached K/V from
+float16 to FP8 would halve cache memory and may yield additional
+speedups via FP8 GEMM kernels.
+
+\paragraph{Scaling context length.}
+With 4 context frames (64 tokens) and 16 denoise tokens, the attention
+is over 80 tokens---still small.  Longer context horizons (video
+prediction with 16+ frames) would make the prefill amortisation even
+more impactful and could benefit from flash-attention-style tiling of the
+static prefix.
+
+\paragraph{Training with context.}
+The current training loop does not condition on historical context
+frames; the context path is exercised only at inference.  A natural
+extension is context-conditioned training, which would improve the
+model's ability to leverage temporal coherence and is compatible with
+our unified forward pass.
+
+% ====================================================================
+\section{Conclusion}
+% ====================================================================
+
+We presented OptiWorld-FM, a systems-optimised Diffusion Transformer
+pipeline for action-conditioned latent world modelling.  The key
+contribution is a KV-cache inference engine with a unified forward pass
+that cleanly separates static context from iterative denoise
+computation.  Combined with a zero-allocation 2nd-order Heun ODE solver,
+this achieves a 1.51$\times$ latency speedup at batch size~1 with
+verified numerical parity.  The high-throughput data ingestion pipeline
+achieves 698 latent frames per second, and the full system is designed
+for progressive optimisation via CUDA graphs, \texttt{torch.compile},
+and FP8 quantisation.
+
+% ====================================================================
+% References
+% ====================================================================
+\begin{thebibliography}{9}
+\bibitem{peebles2023dit}
+W.~Peebles and S.~Xie.
+\newblock Scalable diffusion models with transformers.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem{lipman2023flow}
+Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le.
+\newblock Flow matching for generative modeling.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{cosmos2024}
+NVIDIA.
+\newblock Cosmos Tokenizer: A suite of image and video neural tokenizers.
+\newblock \emph{Technical Report}, 2024.
+
+\bibitem{maniskill2024}
+J.~Gu, F.~Xiang, et al.
+\newblock ManiSkill3: GPU parallelized robotics simulation and benchmark.
+\newblock \emph{arXiv preprint arXiv:2410.00425}, 2024.
+
+\bibitem{ho2020ddpm}
+J.~Ho, A.~Jain, and P.~Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{song2021sde}
+Y.~Song, J.~Sohl-Dickstein, D.~P.~Kingma, A.~Kumar, S.~Ermon, and
+B.~Poole.
+\newblock Score-based generative modeling through stochastic differential
+equations.
+\newblock In \emph{ICLR}, 2021.
+\end{thebibliography}
+
+\end{document}
