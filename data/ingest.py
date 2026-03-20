@@ -59,6 +59,9 @@ class IngestConfig:
     rdcc_nbytes: int = 64 * 1024 * 1024
     rgb_obs: bool = False
     async_writer: bool = True  # use multiprocess HDF5 writer
+    guided: bool = False
+    noise_scale: float = 0.05
+    control_mode: str = "pd_joint_delta_pos"
 
     @property
     def max_total_steps(self) -> int:
@@ -92,7 +95,8 @@ class ManiSkillCollector:
 
     def __enter__(self):
         obs_mode = "rgb" if self.cfg.rgb_obs else "state"
-        kwargs = dict(num_envs=self.cfg.num_envs, obs_mode=obs_mode)
+        kwargs = dict(num_envs=self.cfg.num_envs, obs_mode=obs_mode,
+                      control_mode=self.cfg.control_mode)
         if self.cfg.rgb_obs:
             kwargs["render_mode"] = "sensors"
         self.env = gym.make(self.cfg.task, **kwargs)
@@ -146,7 +150,202 @@ class ManiSkillCollector:
 
 
 # ---------------------------------------------------------------------------
-# 3. Cosmos Latent Encoder (with separate CUDA stream)
+# 3. Guided Policy (distance heuristic + 4-phase state machine)
+# ---------------------------------------------------------------------------
+class GuidedPolicy:
+    """GPU-batched guided trajectory policy for PickCube-v1.
+
+    Requires pd_ee_delta_pos control mode (pinocchio handles IK internally).
+    Action space: [dx, dy, dz, gripper] — 4D world-frame EE deltas.
+
+    Phases (int32 per env on CUDA):
+        0 = APPROACH  — move EE to (cube_xy, cube_z + HOVER_HEIGHT)
+        1 = DESCEND   — move EE to (cube_xy, cube_z + NEAR_HEIGHT)
+        2 = GRASP     — hold position, close gripper for GRASP_STEPS steps
+        3 = LIFT      — move EE upward by LIFT_DELTA per step
+    """
+
+    PHASE_APPROACH = 0
+    PHASE_DESCEND  = 1
+    PHASE_GRASP    = 2
+    PHASE_LIFT     = 3
+
+    HOVER_HEIGHT = 0.10    # metres above cube for APPROACH target
+    NEAR_HEIGHT  = 0.03    # metres above cube for DESCEND target
+    LIFT_DELTA   = 0.05    # metres/step upward during LIFT
+
+    APPROACH_STEPS = 80
+    DESCEND_STEPS  = 60
+    GRASP_STEPS    = 20
+    LIFT_STEPS     = 50
+
+    APPROACH_THRESH = 0.07   # metres — triggers APPROACH→DESCEND early
+    DESCEND_THRESH  = 0.05   # metres — triggers DESCEND→GRASP early
+
+    EE_GAIN    = 0.08   # max EE displacement per step (clamps delta before sending)
+    GRIPPER_DIM = 3     # index of gripper action in 4D action vector
+
+    def __init__(
+        self,
+        env,
+        num_envs: int,
+        noise_scale: float = 0.05,
+        gripper_noise_scale: float = 0.02,
+        device: str = "cuda",
+    ):
+        self.env = env
+        self.num_envs = num_envs
+        self.noise_scale = noise_scale
+        self.gripper_noise_scale = gripper_noise_scale
+        self.device = torch.device(device)
+
+        self.phases      = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+        self.phase_steps = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+
+        action_space = env.unwrapped.single_action_space
+        action_dim   = int(np.prod(action_space.shape))
+        if action_dim != 4:
+            raise ValueError(
+                f"GuidedPolicy requires pd_ee_delta_pos (action_dim=4), "
+                f"got action_dim={action_dim}. Pass control_mode='pd_ee_delta_pos' to gym.make."
+            )
+        self._lo = torch.as_tensor(action_space.low,  dtype=torch.float32, device=self.device)
+        self._hi = torch.as_tensor(action_space.high, dtype=torch.float32, device=self.device)
+
+        # Cache gripper bounds as Python floats (only .item() calls in this class)
+        self._gripper_open  = float(self._hi[self.GRIPPER_DIM].item())
+        self._gripper_close = float(self._lo[self.GRIPPER_DIM].item())
+
+        # Phase step budgets indexed by phase value
+        self._phase_budgets = torch.tensor(
+            [self.APPROACH_STEPS, self.DESCEND_STEPS,
+             self.GRASP_STEPS, self.LIFT_STEPS],
+            dtype=torch.int32, device=self.device,
+        )
+
+        # Pre-allocated buffers — zero allocation in __call__
+        self._action_buf        = torch.zeros(num_envs, action_dim, dtype=torch.float32, device=self.device)
+        self._target_buf        = torch.zeros(num_envs, 3, dtype=torch.float32, device=self.device)
+        self._noise_buf_ee      = torch.zeros(num_envs, 3, dtype=torch.float32, device=self.device)
+        self._noise_buf_gripper = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
+
+        # Probe attribute names once (CPU-side, before hot path)
+        self._cube_attr = self._probe_cube_attribute()
+
+        # Verify EE path exists
+        uwenv = env.unwrapped
+        if not hasattr(uwenv, "agent") or not hasattr(uwenv.agent, "tcp"):
+            raise AttributeError(
+                "env.unwrapped.agent.tcp not found — check ManiSkill version / task"
+            )
+
+        print(f"[GuidedPolicy] pd_ee_delta_pos  action_dim={action_dim}")
+
+    def _probe_cube_attribute(self) -> str:
+        uwenv = self.env.unwrapped
+        candidates = ["cube", "obj", "object", "target_object", "box"]
+        for name in candidates:
+            if hasattr(uwenv, name):
+                return name
+        raise AttributeError(
+            f"Cannot find cube attribute on env.unwrapped. Tried: {candidates}. "
+            f"Add the correct name to GuidedPolicy._probe_cube_attribute."
+        )
+
+    def _get_ee_and_cube_pos(self):
+        """Returns (ee_pos, cube_pos) each [N, 3] float32 on self.device."""
+        uwenv    = self.env.unwrapped
+        ee_pos   = uwenv.agent.tcp.pose.p.to(self.device)
+        cube_pos = getattr(uwenv, self._cube_attr).pose.p.to(self.device)
+        return ee_pos, cube_pos
+
+    def _advance_phases(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor):
+        """Update self.phases and self.phase_steps inplace using only torch.where."""
+        hover_target = cube_pos.clone()
+        hover_target[:, 2] = cube_pos[:, 2] + self.HOVER_HEIGHT
+        near_target  = cube_pos.clone()
+        near_target[:, 2]  = cube_pos[:, 2] + self.NEAR_HEIGHT
+
+        phase_is_0 = (self.phases == self.PHASE_APPROACH)
+        active_target = torch.where(phase_is_0.unsqueeze(1), hover_target, near_target)
+        dist = torch.norm(ee_pos - active_target, dim=-1)  # [N]
+
+        budget = self._phase_budgets[self.phases]
+        budget_exceeded = self.phase_steps >= budget
+
+        thresh = torch.where(
+            phase_is_0,
+            torch.full_like(dist, self.APPROACH_THRESH),
+            torch.full_like(dist, self.DESCEND_THRESH),
+        )
+        in_proximity_phase = (self.phases == self.PHASE_APPROACH) | \
+                             (self.phases == self.PHASE_DESCEND)
+        proximity_trigger  = in_proximity_phase & (dist < thresh)
+
+        should_advance = budget_exceeded | proximity_trigger
+
+        next_phase = (self.phases + 1) % 4
+        self.phases      = torch.where(should_advance, next_phase, self.phases)
+        self.phase_steps.mul_((~should_advance).int()).add_(1)
+
+    def _compute_actions(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor):
+        """Fill self._action_buf inplace with joint delta actions."""
+        # --- Target selection ---
+        self._target_buf.copy_(cube_pos)
+        approach_z = cube_pos[:, 2] + self.HOVER_HEIGHT
+        descend_z  = cube_pos[:, 2] + self.NEAR_HEIGHT
+
+        phase_is_0 = (self.phases == self.PHASE_APPROACH).unsqueeze(1)
+        phase_is_3 = (self.phases == self.PHASE_LIFT).unsqueeze(1)
+
+        target_z_012 = torch.where(phase_is_0.squeeze(1), approach_z, descend_z)
+        self._target_buf[:, 2] = target_z_012
+
+        lift_target = ee_pos.clone()
+        lift_target[:, 2] = ee_pos[:, 2] + self.LIFT_DELTA
+
+        target = torch.where(phase_is_3, lift_target, self._target_buf)
+
+        # --- World-frame EE delta, clamped to EE_GAIN ---
+        delta = (target - ee_pos).clamp_(-self.EE_GAIN, self.EE_GAIN)  # [N, 3]
+
+        # --- pd_ee_delta_pos: dims 0-2 are directly [dx, dy, dz] in world frame ---
+        self._action_buf.zero_()
+        self._action_buf[:, :3].copy_(delta)
+
+        # --- Gripper: open for phases 0,1,3; close for phase 2 ---
+        is_grasp    = (self.phases == self.PHASE_GRASP).float()
+        gripper_cmd = self._gripper_open + \
+                      (self._gripper_close - self._gripper_open) * is_grasp
+        self._action_buf[:, self.GRIPPER_DIM].copy_(gripper_cmd)
+
+        return self._action_buf
+
+    def _inject_noise(self):
+        """Add Gaussian noise inplace, then clamp to action bounds."""
+        self._noise_buf_ee.normal_(0.0, self.noise_scale)
+        self._action_buf[:, :3].add_(self._noise_buf_ee)
+        self._noise_buf_gripper.normal_(0.0, self.gripper_noise_scale)
+        self._action_buf[:, self.GRIPPER_DIM].add_(self._noise_buf_gripper)
+        self._action_buf.clamp_(self._lo, self._hi)
+
+    def reset_done_envs(self, dones: torch.Tensor):
+        """Reset phase to APPROACH for envs where dones=True. GPU-safe, no .item()."""
+        not_done = (~dones).int()
+        self.phases.mul_(not_done)
+        self.phase_steps.mul_(not_done)
+
+    def __call__(self) -> torch.Tensor:
+        with nvtx.range("GuidedPolicy"):
+            ee_pos, cube_pos = self._get_ee_and_cube_pos()
+            self._advance_phases(ee_pos, cube_pos)
+            self._compute_actions(ee_pos, cube_pos)
+            self._inject_noise()
+            return self._action_buf
+
+
+# ---------------------------------------------------------------------------
+# 4. Cosmos Latent Encoder (with separate CUDA stream)
 # ---------------------------------------------------------------------------
 class CosmosLatentEncoder:
     """Cosmos-Tokenizer-CI16x16 encoder with optional CUDA stream pipelining.
@@ -484,6 +683,15 @@ def run(cfg: IngestConfig):
             for i in range(cfg.num_envs):
                 writer.ensure_episode(i)
 
+            policy = GuidedPolicy(
+                env=collector.env,
+                num_envs=cfg.num_envs,
+                noise_scale=cfg.noise_scale,
+            ) if cfg.guided else None
+
+            if policy is not None:
+                obs, _ = collector.reset()
+
             completed_episodes = 0
             step_count = 0
             buf_idx = 0  # current buffer index
@@ -500,7 +708,7 @@ def run(cfg: IngestConfig):
 
                 # --- 1. Step envs on default stream ---
                 bench.cuda_start("env_step")
-                actions = collector.sample_random_actions()
+                actions = policy() if policy is not None else collector.sample_random_actions()
                 obs, rewards, terms, truncs, infos = collector.step(actions)
                 bench.cuda_stop("env_step")
 
@@ -554,6 +762,8 @@ def run(cfg: IngestConfig):
                 prev_rewards = rewards
                 prev_terms = terms
                 prev_dones = terms | truncs
+                if policy is not None:
+                    policy.reset_done_envs(prev_dones.bool())
                 buf_idx = 1 - buf_idx  # swap buffers
 
             # --- Drain final pending encode ---
@@ -632,6 +842,13 @@ def parse_args():
     p.add_argument("--rgb_obs", action="store_true")
     p.add_argument("--no_async_writer", action="store_true",
                     help="Disable async HDF5 writer (use sync instead)")
+    p.add_argument("--guided", action="store_true",
+                    help="Use guided heuristic policy instead of random actions")
+    p.add_argument("--noise_scale", type=float, default=0.05,
+                    help="Gaussian noise std on action dims (guided mode only)")
+    p.add_argument("--control_mode", type=str, default="pd_joint_delta_pos",
+                    choices=["pd_joint_delta_pos", "pd_ee_delta_pos"],
+                    help="Robot controller: pd_ee_delta_pos requires pinocchio")
     p.add_argument("--verify_only", action="store_true")
     args = p.parse_args()
     cfg = IngestConfig(**{k: v for k, v in vars(args).items()

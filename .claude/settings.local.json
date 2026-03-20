@@ -6,7 +6,11 @@
       "WebSearch",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:arxiv.org)",
-      "WebFetch(domain:apxml.com)"
+      "WebFetch(domain:apxml.com)",
+      "Bash(python data/ingest.py --task PickCube-v1 --num_envs 8 --max_episodes 5 --max_steps 100 --guided --noise_scale 0.05 --no_async_writer)",
+      "Bash(conda search:*)",
+      "Bash(conda install:*)",
+      "Bash(cd:*)"
     ]
   }
 }
