@@ -61,7 +61,30 @@ class TrajectoryDataset(Dataset):
         # Action that led to this frame (action at t-1 produces frame at t)
         action = torch.from_numpy(grp["actions"][t - 1].astype(np.float32))
 
-        result = {"x_1": x_1, "action": action}
+        # --- Enriched conditioning ---
+        # EE position at t-1 is always available from the robot's proprioception.
+        # Cube position at t is stored as an auxiliary supervision target only
+        # (not available at inference without perception).
+        if "ee_pos" in grp:
+            ee_pos   = torch.from_numpy(grp["ee_pos"][t - 1].astype(np.float32))   # [3]
+            cube_pos = torch.from_numpy(grp["cube_pos"][t].astype(np.float32))      # [3]
+            phase    = int(grp["phase"][t - 1])
+        else:
+            # Backwards-compatible fallback for HDF5 files without state fields
+            ee_pos   = torch.zeros(3)
+            cube_pos = torch.zeros(3)
+            phase    = -1
+
+        # 7D conditioning vector: [dx, dy, dz, gripper, ee_x, ee_y, ee_z]
+        cond = torch.cat([action, ee_pos])
+
+        result = {
+            "x_1":      x_1,
+            "action":   action,   # kept for reference / compat
+            "cond":     cond,     # 7D: what the model actually receives
+            "cube_pos": cube_pos, # auxiliary supervision target
+            "phase":    torch.tensor(phase, dtype=torch.long),
+        }
 
         # Optional context frames for cached inference validation
         if self.ctx_frames > 0:

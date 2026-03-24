@@ -22,7 +22,7 @@ NUM_HEADS = 6
 HEAD_DIM = HIDDEN_DIM // NUM_HEADS  # 64
 DEPTH = 12
 MLP_RATIO = 4.0
-ACTION_DIM = 8
+ACTION_DIM = 7  # [dx, dy, dz, gripper, ee_x, ee_y, ee_z]
 LATENT_H = 8
 LATENT_W = 8
 NUM_PATCHES = (LATENT_H // PATCH_SIZE) * (LATENT_W // PATCH_SIZE)  # 16
@@ -94,6 +94,35 @@ class ActionEmbedder(nn.Module):
     def forward(self, action: torch.Tensor) -> torch.Tensor:
         with record_function("ActionEmbedder"):
             return self.mlp(action)  # [B, 8] -> [B, 384]
+
+
+# ---------------------------------------------------------------------------
+# CubePosHead — auxiliary head for cube position prediction
+# ---------------------------------------------------------------------------
+class CubePosHead(nn.Module):
+    """Predicts cube XYZ from mean-pooled DiT token representation.
+
+    Used as an auxiliary loss during training to force the latent representation
+    to geometrically ground object location. Not used at inference time.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(HIDDEN_DIM),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM // 2),
+            nn.SiLU(),
+            nn.Linear(HIDDEN_DIM // 2, 3),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            tokens: [B, N, D] final DiT block output (before FinalLayer)
+        Returns:
+            [B, 3] predicted cube XYZ
+        """
+        with record_function("CubePosHead"):
+            return self.mlp(tokens.mean(dim=1))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +272,7 @@ class DiTSmall(nn.Module):
 
         self.blocks = nn.ModuleList([DiTBlock() for _ in range(DEPTH)])
         self.final_layer = FinalLayer()
+        self.cube_pos_head = CubePosHead()
 
     def forward(
         self,
@@ -250,6 +280,7 @@ class DiTSmall(nn.Module):
         t: torch.Tensor,
         action: torch.Tensor,
         cache: KVCache | None = None,
+        return_aux: bool = False,
     ) -> torch.Tensor:
         """Unified forward pass.
 
@@ -258,6 +289,10 @@ class DiTSmall(nn.Module):
 
         When *cache* is provided (inference with prefilled context), denoise
         tokens attend to the full [context | denoise] KV stored in the cache.
+
+        Args:
+            return_aux: If True, returns (velocity, cube_pos_pred) tuple.
+                        Used during training for the auxiliary cube-position loss.
         """
         with record_function("DiTSmall"):
             x = self.patch_embed(x) + self.pos_embed  # [B, 16, 384]
@@ -269,8 +304,12 @@ class DiTSmall(nn.Module):
             for i, block in enumerate(self.blocks):
                 x = block(x, c, cache=cache, layer_idx=i)
 
-            x = self.final_layer(x, c)  # [B, 16, 64]
-            return self._unpatchify(x)  # [B, 16, 8, 8]
+            tokens = x  # [B, 16, 384] — save before FinalLayer for aux head
+            v = self._unpatchify(self.final_layer(tokens, c))  # [B, 16, 8, 8]
+
+            if return_aux:
+                return v, self.cube_pos_head(tokens)  # ([B,16,8,8], [B,3])
+            return v
 
     def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]

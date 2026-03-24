@@ -15,3 +15,6 @@
 - **Profile:** `nsys profile -w true -t cuda,nvtx,osrt -o profiler/rep_%b python inference/bench.py`
 - **Check Memory:** `nvidia-smi --query-gpu=memory.used --format=csv`
 - **Compile:** Always test with `torch.compile(model, mode="max-autotune")`.
+
+## 4. Environment Setup
+- **Conda:** `Always use the ml_env conda environment when running things`

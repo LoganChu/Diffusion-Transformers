@@ -10,7 +10,11 @@
       "Bash(python data/ingest.py --task PickCube-v1 --num_envs 8 --max_episodes 5 --max_steps 100 --guided --noise_scale 0.05 --no_async_writer)",
       "Bash(conda search:*)",
       "Bash(conda install:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(xargs grep:*)",
+      "Bash(\"C:/Users/s-lch/anaconda3/envs/ml_env/python.exe\" data/ingest.py --task PickCube-v1 --num_envs 64 --max_episodes 100000 --max_steps 350 --hdf5_path trajectories_100k.h5 --guided --noise_scale 0.15 --control_mode pd_ee_delta_pos --cosmos_ckpt pretrained_ckpts/Cosmos-Tokenizer-CI16x16)",
+      "Bash(\"C:/Users/s-lch/anaconda3/envs/ml_env/python.exe\" data/ingest.py --task PickCube-v1 --num_envs 64 --max_episodes 100000 --max_steps 350 --hdf5_path trajectories_100k.h5 --guided --noise_scale 0.15 --control_mode pd_ee_delta_pos --cosmos_ckpt pretrained_ckpts/Cosmos-Tokenizer-CI16x16 --no_async_writer)",
+      "Bash(find 'C:/Users/s-lch/OneDrive - Duke University/Sophomore 2025-2026/Second Semester/CS 590 Systems of ML/Diffusion-Transformers' -name *.md -type f)"
     ]
   }
 }

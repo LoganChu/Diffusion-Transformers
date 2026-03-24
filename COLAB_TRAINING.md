@@ -18,17 +18,17 @@ wandb.login()
 
 ## 2. Upload Data
 
-Upload `trajectories_10k.h5` to the Colab runtime or mount Google Drive:
+Upload `trajectories_10k_v2.h5` (the updated dataset with `ee_pos`, `cube_pos`, `phase`) to the Colab runtime or mount Google Drive:
 
 ```python
 # Option A: Google Drive
 from google.colab import drive
 drive.mount('/content/drive')
-!ln -s /content/drive/MyDrive/trajectories_10k.h5 trajectories_10k.h5
+!ln -s /content/drive/MyDrive/trajectories_10k_v2.h5 trajectories_10k_v2.h5
 
 # Option B: Direct upload
 from google.colab import files
-uploaded = files.upload()  # select trajectories_10k.h5
+uploaded = files.upload()  # select trajectories_10k_v2.h5
 ```
 
 ## 3. Verify GPU
@@ -45,7 +45,7 @@ print(f"bf16: {torch.cuda.is_bf16_supported()}")  # Should be True on A100
 ```bash
 # Full training run
 !python -m training.train \
-    --hdf5 trajectories_10k.h5 \
+    --hdf5 trajectories_10k_v2.h5 \
     --batch_size 256 \
     --epochs 100 \
     --lr 1e-3 \
@@ -55,7 +55,7 @@ print(f"bf16: {torch.cuda.is_bf16_supported()}")  # Should be True on A100
     --log_every 50 \
     --num_workers 2 \
     --wandb_project optiworld-dit \
-    --wandb_run_name "a100-cfm-v1"
+    --wandb_run_name "a100-cfm-v2-state"
 ```
 
 ### Tuning Tips
@@ -68,20 +68,22 @@ print(f"bf16: {torch.cuda.is_bf16_supported()}")  # Should be True on A100
 ## 5. Monitor
 
 Watch the WandB dashboard for:
-- `train/loss` — should decrease steadily
+- `train/loss` — total loss (CFM + 0.1 × aux), should decrease steadily
+- `train/loss_cfm` — flow matching loss; primary convergence signal
+- `train/loss_aux` — cube position prediction loss; should drop quickly (simple regression)
 - `train/grad_norm` — should stay < 1.0 after warmup
 - `val/loss` — track for plateau detection
 - `val/rollout_gif` — visual quality check every 1000 steps
-- `gpu/mem_peak_mb` — memory utilization
+- `gpu/mem_peak_mb` — memory utilization (~4-6 GB, slightly higher than before due to CubePosHead)
 
 ## 6. Resume from Checkpoint
 
 ```bash
 !python -m training.train \
-    --hdf5 trajectories_10k.h5 \
+    --hdf5 trajectories_10k_v2.h5 \
     --resume checkpoints/best.pt \
     --epochs 200 \
-    --wandb_run_name "a100-cfm-v1-resumed"
+    --wandb_run_name "a100-cfm-v2-state-resumed"
 ```
 
 ## 7. Download Results

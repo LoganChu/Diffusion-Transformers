@@ -98,11 +98,11 @@ def make_validation_gif(
 
     model.eval()
     batch = next(iter(val_loader))
-    x_1 = batch["x_1"][:4].cuda()
-    action = batch["action"][:4].cuda()
+    x_1  = batch["x_1"][:4].cuda()
+    cond = batch["cond"][:4].cuda()
 
     # Generate predictions
-    x_pred = sample_heun(model, action, num_steps=8)
+    x_pred = sample_heun(model, cond, num_steps=8)
 
     # Stack ground-truth and predicted for comparison
     # Each is [4, 16, 8, 8] — take first 3 channels as pseudo-RGB
@@ -227,8 +227,9 @@ def train(args):
         num_batches = 0
 
         for batch in train_loader:
-            x_1 = batch["x_1"].to(device, non_blocking=True)
-            action = batch["action"].to(device, non_blocking=True)
+            x_1       = batch["x_1"].to(device, non_blocking=True)
+            cond      = batch["cond"].to(device, non_blocking=True)       # [B, 7]
+            cube_pos  = batch["cube_pos"].to(device, non_blocking=True)   # [B, 3]
             B = x_1.shape[0]
 
             # --- CFM forward (inline for efficiency) ---
@@ -239,8 +240,10 @@ def train(args):
                     t_exp = t.view(B, 1, 1, 1)
                     x_t = (1 - t_exp) * x_0 + t_exp * x_1
                     v_target = x_1 - x_0
-                    v_pred = model(x_t, t, action)
-                    loss = F.mse_loss(v_pred, v_target)
+                    v_pred, cube_pos_pred = model(x_t, t, cond, return_aux=True)
+                    loss_cfm = F.mse_loss(v_pred, v_target)
+                    loss_aux = F.mse_loss(cube_pos_pred, cube_pos)
+                    loss = loss_cfm + 0.1 * loss_aux
 
             # --- Backward ---
             optimizer.zero_grad(set_to_none=True)
@@ -263,20 +266,25 @@ def train(args):
 
             # --- Logging ---
             if global_step % args.log_every == 0:
-                lr_current = optimizer.param_groups[0]["lr"]
-                mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                lr_current   = optimizer.param_groups[0]["lr"]
+                mem_mb       = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                loss_cfm_val = loss_cfm.item()
+                loss_aux_val = loss_aux.item()
                 print(
                     f"[step {global_step:>6d} | epoch {epoch:>3d}] "
-                    f"loss={loss_val:.4f}  grad_norm={grad_norm:.3f}  "
+                    f"loss={loss_val:.4f}  cfm={loss_cfm_val:.4f}  "
+                    f"aux={loss_aux_val:.4f}  grad_norm={grad_norm:.3f}  "
                     f"lr={lr_current:.2e}  mem={mem_mb:.0f}MB"
                 )
                 if run is not None:
                     run.log(
                         {
-                            "train/loss": loss_val,
+                            "train/loss":      loss_val,
+                            "train/loss_cfm":  loss_cfm_val,
+                            "train/loss_aux":  loss_aux_val,
                             "train/grad_norm": float(grad_norm),
-                            "train/lr": lr_current,
-                            "train/epoch": epoch,
+                            "train/lr":        lr_current,
+                            "train/epoch":     epoch,
                             "gpu/mem_peak_mb": mem_mb,
                         },
                         step=global_step,
@@ -292,15 +300,15 @@ def train(args):
                     for i, vbatch in enumerate(val_loader):
                         if i >= args.val_batches:
                             break
-                        vx1 = vbatch["x_1"].to(device, non_blocking=True)
-                        vact = vbatch["action"].to(device, non_blocking=True)
+                        vx1  = vbatch["x_1"].to(device, non_blocking=True)
+                        vcond = vbatch["cond"].to(device, non_blocking=True)
                         vB = vx1.shape[0]
                         vt = torch.rand(vB, device=device)
                         vx0 = torch.randn_like(vx1)
                         vt_exp = vt.view(vB, 1, 1, 1)
                         vx_t = (1 - vt_exp) * vx0 + vt_exp * vx1
                         vv_target = vx1 - vx0
-                        vv_pred = model(vx_t, vt, vact)
+                        vv_pred = model(vx_t, vt, vcond)
                         val_losses.append(F.mse_loss(vv_pred, vv_target).item())
 
                 val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0

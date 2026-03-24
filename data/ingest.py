@@ -5,7 +5,7 @@ compresses observations into latents via Cosmos-VAE, and stores them in HDF5
 for efficient sliding-window training retrieval.
 
 Usage:
-    python data/ingest.py --task PickCube-v1 --num_envs 64 --max_episodes 10000
+    python data/ingest.py --task PickCube-v1 --num_envs 128 --max_episodes 100000
 
 Optimizations (v2):
   - Double-buffered VAE on a separate CUDA stream (overlaps encode with env.step)
@@ -13,9 +13,10 @@ Optimizations (v2):
   - rdcc_nbytes=64MB chunk cache for sequential write performance
   - Increased default num_envs=64 to better amortize physics step cost
 
-Note: SAPIEN's Vulkan-CUDA interop crashes on RTX 50-series Windows.
-Until fixed upstream, use obs_mode="state" with random projection (default).
-Pass --rgb_obs once the SAPIEN renderer is patched.
+Rendering: obs_mode="state" + render_mode="rgb_array" + render_backend="cpu".
+RGB frames come from env.render() after each step, not the obs dict. This avoids
+the Vulkan-CUDA interop crash on RTX 50-series Windows (same approach as
+verify_env.py which is confirmed working).
 """
 
 from __future__ import annotations
@@ -57,11 +58,9 @@ class IngestConfig:
     seed: int = 42
     flush_every: int = 50
     rdcc_nbytes: int = 64 * 1024 * 1024
-    rgb_obs: bool = False
     async_writer: bool = True  # use multiprocess HDF5 writer
-    guided: bool = False
     noise_scale: float = 0.05
-    control_mode: str = "pd_joint_delta_pos"
+    control_mode: str = "pd_ee_delta_pos"
 
     @property
     def max_total_steps(self) -> int:
@@ -86,29 +85,26 @@ def ensure_cosmos_weights(ckpt_dir: str) -> str:
 # 2. ManiSkill Collector
 # ---------------------------------------------------------------------------
 class ManiSkillCollector:
-    """Wraps ManiSkill GPU-vectorized env. Supports state-to-RGB projection."""
+    """Wraps ManiSkill env with CPU renderer for real RGB obs.
+
+    Uses obs_mode="state" + render_mode="rgb_array" + render_backend="cpu" to
+    avoid the Vulkan-CUDA interop crash on RTX 50-series Windows. RGB frames are
+    obtained via env.render() after each step rather than from the obs dict.
+    """
 
     def __init__(self, cfg: IngestConfig):
         self.cfg = cfg
         self.env: Optional[gym.Env] = None
-        self._proj: Optional[torch.Tensor] = None
 
     def __enter__(self):
-        obs_mode = "rgb" if self.cfg.rgb_obs else "state"
-        kwargs = dict(num_envs=self.cfg.num_envs, obs_mode=obs_mode,
-                      control_mode=self.cfg.control_mode)
-        if self.cfg.rgb_obs:
-            kwargs["render_mode"] = "sensors"
-        self.env = gym.make(self.cfg.task, **kwargs)
-
-        if not self.cfg.rgb_obs:
-            state_dim = self.env.unwrapped.single_observation_space.shape[0]
-            gen = torch.Generator(device="cuda").manual_seed(self.cfg.seed + 9999)
-            self._proj = torch.randn(
-                state_dim, 3 * OBS_H * OBS_W,
-                dtype=torch.float16, device="cuda", generator=gen,
-            )
-            self._proj.mul_(0.5 / (state_dim ** 0.5))
+        self.env = gym.make(
+            self.cfg.task,
+            num_envs=self.cfg.num_envs,
+            obs_mode="state",
+            render_mode="rgb_array",
+            render_backend="cpu",
+            control_mode=self.cfg.control_mode,
+        )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -120,29 +116,26 @@ class ManiSkillCollector:
     def reset(self):
         return self.env.reset(seed=self.cfg.seed)
 
-    def sample_random_actions(self) -> torch.Tensor:
-        action_space = self.env.unwrapped.single_action_space
-        actions = torch.rand(
-            self.cfg.num_envs, *action_space.shape,
-            dtype=torch.float32, device="cuda",
-        )
-        lo = torch.as_tensor(action_space.low, dtype=torch.float32, device="cuda")
-        hi = torch.as_tensor(action_space.high, dtype=torch.float32, device="cuda")
-        actions.mul_(hi - lo).add_(lo)
-        return actions
-
     def step(self, actions: torch.Tensor):
         return self.env.step(actions)
 
     def extract_rgb(self, obs, frame_buf: torch.Tensor):
-        """Extract/synthesize RGB into pre-allocated frame_buf [N,3,H,W] float16."""
-        if self.cfg.rgb_obs:
-            rgb = obs["sensor_data"]["base_camera"]["rgb"]
-            frame_buf.copy_(rgb[:, :, :, :3].permute(0, 3, 1, 2).to(torch.float16))
-            frame_buf.div_(255.0)
-        else:
-            projected = obs.to(torch.float16) @ self._proj
-            frame_buf.copy_(projected.sigmoid_().view(-1, 3, OBS_H, OBS_W))
+        """Render RGB via env.render() and fill frame_buf [N,3,H,W] float16.
+
+        obs is unused — kept for API compatibility with the main loop.
+        env.render() returns [N,H,W,3] uint8 via the CPU renderer.
+        Resizes to (OBS_H, OBS_W) if the render resolution differs.
+        """
+        frame = self.env.render()  # [N, H, W, 3] uint8
+        if not isinstance(frame, torch.Tensor):
+            frame = torch.from_numpy(np.asarray(frame))
+        # [N,H,W,3] → [N,3,H,W] float32 in [0,1]
+        frame = frame[..., :3].permute(0, 3, 1, 2).float().div_(255.0)
+        if frame.shape[-2:] != (OBS_H, OBS_W):
+            frame = torch.nn.functional.interpolate(
+                frame, size=(OBS_H, OBS_W), mode="bilinear", align_corners=False,
+            )
+        frame_buf.copy_(frame.to(torch.float16))
 
     @property
     def action_dim(self) -> int:
@@ -171,16 +164,16 @@ class GuidedPolicy:
     PHASE_LIFT     = 3
 
     HOVER_HEIGHT = 0.10    # metres above cube for APPROACH target
-    NEAR_HEIGHT  = 0.03    # metres above cube for DESCEND target
+    NEAR_HEIGHT  = 0.00    # metres above cube for DESCEND target (TCP at cube centre)
     LIFT_DELTA   = 0.05    # metres/step upward during LIFT
 
     APPROACH_STEPS = 80
-    DESCEND_STEPS  = 60
-    GRASP_STEPS    = 20
+    DESCEND_STEPS  = 150
+    GRASP_STEPS    = 40
     LIFT_STEPS     = 50
 
-    APPROACH_THRESH = 0.07   # metres — triggers APPROACH→DESCEND early
-    DESCEND_THRESH  = 0.05   # metres — triggers DESCEND→GRASP early
+    APPROACH_THRESH = 0.04   # metres — triggers APPROACH→DESCEND early
+    DESCEND_THRESH  = 0.008  # metres — triggers DESCEND→GRASP early
 
     EE_GAIN    = 0.08   # max EE displacement per step (clamps delta before sending)
     GRIPPER_DIM = 3     # index of gripper action in 4D action vector
@@ -313,10 +306,11 @@ class GuidedPolicy:
         self._action_buf.zero_()
         self._action_buf[:, :3].copy_(delta)
 
-        # --- Gripper: open for phases 0,1,3; close for phase 2 ---
-        is_grasp    = (self.phases == self.PHASE_GRASP).float()
+        # --- Gripper: open for phases 0,1; close for phases 2 (GRASP) and 3 (LIFT) ---
+        is_closed   = ((self.phases == self.PHASE_GRASP) |
+                       (self.phases == self.PHASE_LIFT)).float()
         gripper_cmd = self._gripper_open + \
-                      (self._gripper_close - self._gripper_open) * is_grasp
+                      (self._gripper_close - self._gripper_open) * is_closed
         self._action_buf[:, self.GRIPPER_DIM].copy_(gripper_cmd)
 
         return self._action_buf
@@ -331,7 +325,7 @@ class GuidedPolicy:
 
     def reset_done_envs(self, dones: torch.Tensor):
         """Reset phase to APPROACH for envs where dones=True. GPU-safe, no .item()."""
-        not_done = (~dones).int()
+        not_done = (~dones.to(self.device)).int()
         self.phases.mul_(not_done)
         self.phase_steps.mul_(not_done)
 
@@ -341,6 +335,9 @@ class GuidedPolicy:
             self._advance_phases(ee_pos, cube_pos)
             self._compute_actions(ee_pos, cube_pos)
             self._inject_noise()
+            # Expose state for the data-collection loop to store per step
+            self.last_ee_pos   = ee_pos    # [N, 3] absolute EE position
+            self.last_cube_pos = cube_pos  # [N, 3] cube position
             return self._action_buf
 
 
@@ -422,22 +419,30 @@ class HDF5Writer:
         if env_id not in self._buffers:
             self._buffers[env_id] = {
                 "latents": [], "actions": [], "rewards": [], "dones": [],
+                "ee_pos": [], "cube_pos": [], "phase": [],
             }
 
     def append_frame(self, env_id: int, latent: np.ndarray,
-                     action: np.ndarray, reward: float, done: bool):
+                     action: np.ndarray, reward: float, done: bool,
+                     ee_pos: np.ndarray, cube_pos: np.ndarray, phase: int):
         buf = self._buffers[env_id]
         buf["latents"].append(latent)
         buf["actions"].append(action)
         buf["rewards"].append(reward)
         buf["dones"].append(done)
+        buf["ee_pos"].append(ee_pos)
+        buf["cube_pos"].append(cube_pos)
+        buf["phase"].append(phase)
 
     def append_batch(self, latents: np.ndarray, actions: np.ndarray,
-                     rewards: np.ndarray, dones: np.ndarray, num_envs: int):
+                     rewards: np.ndarray, dones: np.ndarray,
+                     ee_pos: np.ndarray, cube_pos: np.ndarray,
+                     phases: np.ndarray, num_envs: int):
         for i in range(num_envs):
             self.ensure_episode(i)
             self.append_frame(i, latents[i], actions[i],
-                              float(rewards[i]), bool(dones[i]))
+                              float(rewards[i]), bool(dones[i]),
+                              ee_pos[i], cube_pos[i], int(phases[i]))
 
     def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
         buf = self._buffers.pop(env_id, None)
@@ -445,10 +450,13 @@ class HDF5Writer:
             return
         T = len(buf["latents"])
         grp = self.h5file.create_group(f"episode_{self._episode_count:04d}")
-        lat_arr = np.stack(buf["latents"], axis=0).astype(np.float16)
-        act_arr = np.stack(buf["actions"], axis=0).astype(np.float32)
-        rew_arr = np.array(buf["rewards"], dtype=np.float32)
-        done_arr = np.array(buf["dones"], dtype=bool)
+        lat_arr      = np.stack(buf["latents"],   axis=0).astype(np.float16)
+        act_arr      = np.stack(buf["actions"],   axis=0).astype(np.float32)
+        rew_arr      = np.array(buf["rewards"],   dtype=np.float32)
+        done_arr     = np.array(buf["dones"],     dtype=bool)
+        ee_pos_arr   = np.stack(buf["ee_pos"],    axis=0).astype(np.float32)
+        cube_pos_arr = np.stack(buf["cube_pos"],  axis=0).astype(np.float32)
+        phase_arr    = np.array(buf["phase"],     dtype=np.int8)
         C = self.CHUNK_T
         grp.create_dataset("latents", data=lat_arr,
                            chunks=(min(C, T), *lat_arr.shape[1:]),
@@ -458,7 +466,13 @@ class HDF5Writer:
                            compression="lzf")
         grp.create_dataset("rewards", data=rew_arr,
                            chunks=(min(C, T),), compression="lzf")
-        grp.create_dataset("dones", data=done_arr, chunks=(min(C, T),))
+        grp.create_dataset("dones",    data=done_arr,     chunks=(min(C, T),))
+        grp.create_dataset("ee_pos",   data=ee_pos_arr,   chunks=(min(C, T), 3),
+                           compression="lzf")
+        grp.create_dataset("cube_pos", data=cube_pos_arr, chunks=(min(C, T), 3),
+                           compression="lzf")
+        grp.create_dataset("phase",    data=phase_arr,    chunks=(min(C, T),),
+                           compression="lzf")
         grp.attrs["length"] = T
         grp.attrs["completed"] = completed
         grp.attrs["task"] = task
@@ -498,8 +512,9 @@ def _hdf5_writer_process(path: str, action_dim: int, metadata: dict,
                 break
             cmd = msg[0]
             if cmd == "append":
-                _, latents, actions, rewards, dones, num_envs = msg
-                writer.append_batch(latents, actions, rewards, dones, num_envs)
+                _, latents, actions, rewards, dones, ee_pos, cube_pos, phases, num_envs = msg
+                writer.append_batch(latents, actions, rewards, dones,
+                                    ee_pos, cube_pos, phases, num_envs)
             elif cmd == "finalize":
                 _, env_id, task, seed, completed = msg
                 writer.finalize_episode(env_id, task, seed, completed)
@@ -539,8 +554,11 @@ class AsyncHDF5Writer:
         self.queue.put(("ensure", env_id))
 
     def append_batch(self, latents: np.ndarray, actions: np.ndarray,
-                     rewards: np.ndarray, dones: np.ndarray, num_envs: int):
-        self.queue.put(("append", latents, actions, rewards, dones, num_envs))
+                     rewards: np.ndarray, dones: np.ndarray,
+                     ee_pos: np.ndarray, cube_pos: np.ndarray,
+                     phases: np.ndarray, num_envs: int):
+        self.queue.put(("append", latents, actions, rewards, dones,
+                        ee_pos, cube_pos, phases, num_envs))
 
     def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
         self.queue.put(("finalize", env_id, task, seed, completed))
@@ -687,10 +705,8 @@ def run(cfg: IngestConfig):
                 env=collector.env,
                 num_envs=cfg.num_envs,
                 noise_scale=cfg.noise_scale,
-            ) if cfg.guided else None
-
-            if policy is not None:
-                obs, _ = collector.reset()
+            )
+            obs, _ = collector.reset()
 
             completed_episodes = 0
             step_count = 0
@@ -708,7 +724,11 @@ def run(cfg: IngestConfig):
 
                 # --- 1. Step envs on default stream ---
                 bench.cuda_start("env_step")
-                actions = policy() if policy is not None else collector.sample_random_actions()
+                actions = policy()
+                # Capture state immediately after policy() before any phase reset
+                cur_ee_pos   = policy.last_ee_pos.cpu()    # [N, 3]
+                cur_cube_pos = policy.last_cube_pos.cpu()  # [N, 3]
+                cur_phases   = policy.phases.cpu()         # [N]
                 obs, rewards, terms, truncs, infos = collector.step(actions)
                 bench.cuda_stop("env_step")
 
@@ -722,15 +742,19 @@ def run(cfg: IngestConfig):
                     encoder.sync()  # wait for previous encode to finish
 
                     bench.cuda_start("cpu_transfer")
-                    latents_cpu = pending_latents.cpu().numpy()
-                    actions_cpu = prev_actions.cpu().numpy()
-                    rewards_cpu = prev_rewards.cpu().numpy()
-                    dones_cpu = prev_dones.cpu().numpy()
+                    latents_cpu  = pending_latents.cpu().numpy()
+                    actions_cpu  = prev_actions.cpu().numpy()
+                    rewards_cpu  = prev_rewards.cpu().numpy()
+                    dones_cpu    = prev_dones.cpu().numpy()
+                    ee_pos_cpu   = prev_ee_pos.numpy()
+                    cube_pos_cpu = prev_cube_pos.numpy()
+                    phases_cpu   = prev_phases.numpy()
                     bench.cuda_stop("cpu_transfer")
 
                     bench.cpu_start("hdf5_write")
                     writer.append_batch(latents_cpu, actions_cpu, rewards_cpu,
-                                        dones_cpu, num_envs=cfg.num_envs)
+                                        dones_cpu, ee_pos_cpu, cube_pos_cpu,
+                                        phases_cpu, num_envs=cfg.num_envs)
                     bench.cpu_stop("hdf5_write")
 
                     step_count += 1
@@ -758,23 +782,29 @@ def run(cfg: IngestConfig):
                 bench.cuda_stop("vae_encode")
 
                 # Save current step's metadata for next iteration's write
-                prev_actions = actions
-                prev_rewards = rewards
-                prev_terms = terms
-                prev_dones = terms | truncs
-                if policy is not None:
-                    policy.reset_done_envs(prev_dones.bool())
+                prev_actions   = actions
+                prev_rewards   = rewards
+                prev_terms     = terms
+                prev_dones     = terms | truncs
+                prev_ee_pos    = cur_ee_pos
+                prev_cube_pos  = cur_cube_pos
+                prev_phases    = cur_phases
+                policy.reset_done_envs(prev_dones.bool())
                 buf_idx = 1 - buf_idx  # swap buffers
 
             # --- Drain final pending encode ---
             if pending_latents is not None:
                 encoder.sync()
-                latents_cpu = pending_latents.cpu().numpy()
-                actions_cpu = prev_actions.cpu().numpy()
-                rewards_cpu = prev_rewards.cpu().numpy()
-                dones_cpu = prev_dones.cpu().numpy()
+                latents_cpu  = pending_latents.cpu().numpy()
+                actions_cpu  = prev_actions.cpu().numpy()
+                rewards_cpu  = prev_rewards.cpu().numpy()
+                dones_cpu    = prev_dones.cpu().numpy()
+                ee_pos_cpu   = prev_ee_pos.numpy()
+                cube_pos_cpu = prev_cube_pos.numpy()
+                phases_cpu   = prev_phases.numpy()
                 writer.append_batch(latents_cpu, actions_cpu, rewards_cpu,
-                                    dones_cpu, num_envs=cfg.num_envs)
+                                    dones_cpu, ee_pos_cpu, cube_pos_cpu,
+                                    phases_cpu, num_envs=cfg.num_envs)
                 step_count += 1
                 done_indices = prev_dones.nonzero(as_tuple=False).squeeze(-1)
                 if done_indices.numel() > 0:
@@ -790,9 +820,7 @@ def run(cfg: IngestConfig):
             bench.stop_total()
             lps = bench.summarize(num_envs=cfg.num_envs, num_steps=step_count)
 
-            ep_count = writer.episode_count if hasattr(writer, 'episode_count') else "N/A"
-            print(f"\nCompleted {completed_episodes} episodes, "
-                  f"{ep_count} written to {cfg.hdf5_path}")
+            print(f"\nCompleted {completed_episodes} episodes written to {cfg.hdf5_path}")
 
     return lps
 
@@ -839,20 +867,17 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--flush_every", type=int, default=50)
     p.add_argument("--rdcc_nbytes", type=int, default=64 * 1024 * 1024)
-    p.add_argument("--rgb_obs", action="store_true")
     p.add_argument("--no_async_writer", action="store_true",
                     help="Disable async HDF5 writer (use sync instead)")
-    p.add_argument("--guided", action="store_true",
-                    help="Use guided heuristic policy instead of random actions")
     p.add_argument("--noise_scale", type=float, default=0.05,
-                    help="Gaussian noise std on action dims (guided mode only)")
-    p.add_argument("--control_mode", type=str, default="pd_joint_delta_pos",
-                    choices=["pd_joint_delta_pos", "pd_ee_delta_pos"],
-                    help="Robot controller: pd_ee_delta_pos requires pinocchio")
+                    help="Gaussian noise std on EE action dims")
+    p.add_argument("--control_mode", type=str, default="pd_ee_delta_pos",
+                    choices=["pd_ee_delta_pos"],
+                    help="Robot controller: pd_ee_delta_pos (pinocchio required)")
     p.add_argument("--verify_only", action="store_true")
     args = p.parse_args()
     cfg = IngestConfig(**{k: v for k, v in vars(args).items()
-                          if k not in ("verify_only", "no_async_writer")})
+                          if k not in ("verify_only", "no_async_writer", "guided")})
     cfg.async_writer = not args.no_async_writer
     return cfg, args.verify_only
 
