@@ -126,6 +126,99 @@ class CubePosHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Task heads — all share the same MLP structure as CubePosHead.
+# They operate on denoise_tokens only (the predicted next-frame region),
+# NOT the full context+denoise sequence, because they predict properties
+# of the next state rather than using all historical context.
+# ---------------------------------------------------------------------------
+
+class RewardHead(nn.Module):
+    """Predicts scalar reward r_t from the next-frame token representation.
+
+    Trained against env rewards stored in the replay buffer.
+    Used by the CEM planner to score candidate trajectories.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(HIDDEN_DIM),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM // 2),
+            nn.SiLU(),
+            nn.Linear(HIDDEN_DIM // 2, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            tokens: [B, N, D] denoise region tokens (x[:, -NUM_PATCHES:, :])
+        Returns:
+            [B, 1] predicted scalar reward
+        """
+        with record_function("RewardHead"):
+            return self.mlp(tokens.mean(dim=1))
+
+
+class DoneHead(nn.Module):
+    """Predicts episode termination logit from the next-frame token representation.
+
+    Returns raw logits (not sigmoid). Apply torch.sigmoid() for probability,
+    or use F.binary_cross_entropy_with_logits() for training.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(HIDDEN_DIM),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM // 2),
+            nn.SiLU(),
+            nn.Linear(HIDDEN_DIM // 2, 1),
+        )
+        # Bias toward not-done at init: most steps are not terminal
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.constant_(self.mlp[-1].bias, -2.0)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            tokens: [B, N, D] denoise region tokens
+        Returns:
+            [B, 1] termination logit (sigmoid → done probability)
+        """
+        with record_function("DoneHead"):
+            return self.mlp(tokens.mean(dim=1))
+
+
+class ValueHead(nn.Module):
+    """Predicts state value V(z_t) — expected discounted return from z_t.
+
+    Trained against Monte-Carlo or TD returns from the replay buffer.
+    Used by the CEM planner to bootstrap long-horizon returns:
+        score = Σ γ^k * r̂_{t+k}  +  γ^H * V̂(z_{t+H})
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(HIDDEN_DIM),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM // 2),
+            nn.SiLU(),
+            nn.Linear(HIDDEN_DIM // 2, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            tokens: [B, N, D] denoise region tokens
+        Returns:
+            [B, 1] predicted state value V(z_t)
+        """
+        with record_function("ValueHead"):
+            return self.mlp(tokens.mean(dim=1))
+
+
+# ---------------------------------------------------------------------------
 # DiTBlock — adaLN-Zero transformer block
 # ---------------------------------------------------------------------------
 class DiTBlock(nn.Module):
@@ -273,6 +366,9 @@ class DiTSmall(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock() for _ in range(DEPTH)])
         self.final_layer = FinalLayer()
         self.cube_pos_head = CubePosHead()
+        self.reward_head = RewardHead()
+        self.done_head   = DoneHead()
+        self.value_head  = ValueHead()
 
     def forward(
         self,
@@ -280,35 +376,75 @@ class DiTSmall(nn.Module):
         t: torch.Tensor,
         action: torch.Tensor,
         cache: KVCache | None = None,
+        ctx_latents: torch.Tensor | None = None,
         return_aux: bool = False,
+        return_heads: bool = False,
     ) -> torch.Tensor:
         """Unified forward pass.
 
-        When *cache* is ``None`` (training / baseline sampling), runs standard
-        self-attention over the denoise tokens only.
+        Training (cache=None, ctx_latents provided):
+            Context tokens are prepended to the denoise tokens and the full
+            sequence is run through standard self-attention.  This matches the
+            computation done by the KV cache at inference.
 
-        When *cache* is provided (inference with prefilled context), denoise
-        tokens attend to the full [context | denoise] KV stored in the cache.
+        Inference (cache provided):
+            Context K/V has been prefilled once via prefill_cache().  Denoise
+            tokens attend to the full [context | denoise] KV in the cache.
+
+        No context (cache=None, ctx_latents=None):
+            Standard self-attention over the 16 denoise tokens only.
 
         Args:
-            return_aux: If True, returns (velocity, cube_pos_pred) tuple.
-                        Used during training for the auxiliary cube-position loss.
+            ctx_latents:  [B, n_ctx, 16, 8, 8] context frames (training only).
+            return_aux:   If True, returns (velocity, cube_pos_pred).
+            return_heads: If True, returns (velocity, reward [B,1], done_logit [B,1],
+                          value [B,1]).  Heads run on denoise_tokens only.
+                          For head training pass a clean latent (t=1) so the
+                          token representations reflect the actual next state.
         """
         with record_function("DiTSmall"):
-            x = self.patch_embed(x) + self.pos_embed  # [B, 16, 384]
+            # --- Embed denoise frame ---
+            x = self.patch_embed(x) + self.pos_embed  # [B, 16, D]
+
             if cache is not None:
-                # Denoise frame occupies the last temporal slot
+                # Inference: denoise occupies the last temporal slot
                 x = x + self.frame_pos_embed[:, -1, :, :]
-            c = self.t_embed(t) + self.action_embed(action)  # [B, 384]
+
+            elif ctx_latents is not None:
+                # Training: embed each context frame and prepend to denoise tokens
+                B, n_ctx, C, H, W = ctx_latents.shape
+                ctx_list = []
+                for i in range(n_ctx):
+                    tok = self.patch_embed(ctx_latents[:, i]) + self.pos_embed
+                    tok = tok + self.frame_pos_embed[:, i, :, :]
+                    ctx_list.append(tok)
+                # Denoise frame uses the last temporal slot (matches inference)
+                x = x + self.frame_pos_embed[:, -1, :, :]
+                # [B, n_ctx*16 + 16, D]
+                x = torch.cat(ctx_list + [x], dim=1)
+
+            c = self.t_embed(t) + self.action_embed(action)  # [B, D]
 
             for i, block in enumerate(self.blocks):
                 x = block(x, c, cache=cache, layer_idx=i)
 
-            tokens = x  # [B, 16, 384] — save before FinalLayer for aux head
-            v = self._unpatchify(self.final_layer(tokens, c))  # [B, 16, 8, 8]
+            # Always use the last NUM_PATCHES tokens for output — these are the
+            # denoise tokens regardless of how many context tokens were prepended
+            denoise_tokens = x[:, -NUM_PATCHES:, :]   # [B, 16, D]
+            v = self._unpatchify(self.final_layer(denoise_tokens, c))
 
             if return_aux:
-                return v, self.cube_pos_head(tokens)  # ([B,16,8,8], [B,3])
+                # cube_pos_head uses ALL tokens — context carries object location
+                return v, self.cube_pos_head(x)
+
+            if return_heads:
+                # Task heads use denoise_tokens only — they predict properties of
+                # the NEXT state, not properties aggregated over history
+                reward = self.reward_head(denoise_tokens)   # [B, 1]
+                done   = self.done_head(denoise_tokens)     # [B, 1] logit
+                value  = self.value_head(denoise_tokens)    # [B, 1]
+                return v, reward, done, value
+
             return v
 
     def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:

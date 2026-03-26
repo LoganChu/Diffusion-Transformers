@@ -15,6 +15,7 @@ import torch
 
 from models.cache import KVCache
 from models.dit import (
+    ACTION_DIM,
     DEPTH,
     HEAD_DIM,
     IN_CHANNELS,
@@ -146,8 +147,8 @@ def main():
     model = DiTSmall().to(device=device, dtype=dtype).eval()
     B = 1
     ctx_latents = torch.randn(B, args.n_ctx, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-    ctx_actions = torch.randn(B, 8, device=device, dtype=dtype)
-    action = torch.randn(B, 8, device=device, dtype=dtype)
+    ctx_actions = torch.randn(B, ACTION_DIM, device=device, dtype=dtype)
+    action      = torch.randn(B, ACTION_DIM, device=device, dtype=dtype)
 
     print(f"Config: BS=1, n_ctx={args.n_ctx}, num_steps={args.num_steps}, "
           f"warmup={args.warmup}, repeats={args.repeats}, dtype={dtype}")

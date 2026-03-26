@@ -40,23 +40,28 @@ from models.dit import DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W
 @torch.no_grad()
 def sample_heun(
     model: nn.Module,
-    action: torch.Tensor,
+    cond: torch.Tensor,
+    ctx_latents: torch.Tensor | None = None,
     num_steps: int = 8,
 ) -> torch.Tensor:
-    """Heun's method (improved Euler) ODE sampler."""
+    """Heun's method (improved Euler) ODE sampler.
+
+    Passes ctx_latents through to model.forward at every ODE step, which
+    is equivalent to (and consistent with) the KV-cached inference path.
+    """
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        B = action.shape[0]
-        x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=action.device)
+        B = cond.shape[0]
+        x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=cond.device)
         dt = 1.0 / num_steps
 
         for i in range(num_steps):
             t = torch.full((B,), i * dt, device=x.device)
-            v1 = model(x, t, action)
+            v1 = model(x, t, cond, ctx_latents=ctx_latents)
             x_euler = x + dt * v1
 
             if i < num_steps - 1:
                 t_next = torch.full((B,), (i + 1) * dt, device=x.device)
-                v2 = model(x_euler, t_next, action)
+                v2 = model(x_euler, t_next, cond, ctx_latents=ctx_latents)
                 x = x + dt * 0.5 * (v1 + v2)
             else:
                 x = x_euler
@@ -100,9 +105,12 @@ def make_validation_gif(
     batch = next(iter(val_loader))
     x_1  = batch["x_1"][:4].cuda()
     cond = batch["cond"][:4].cuda()
+    ctx  = batch.get("ctx_latents")
+    if ctx is not None:
+        ctx = ctx[:4].cuda()
 
     # Generate predictions
-    x_pred = sample_heun(model, cond, num_steps=8)
+    x_pred = sample_heun(model, cond, ctx_latents=ctx, num_steps=8)
 
     # Stack ground-truth and predicted for comparison
     # Each is [4, 16, 8, 8] — take first 3 channels as pseudo-RGB
@@ -152,8 +160,8 @@ def train(args):
         )
 
     # ---- Data ----
-    dataset = TrajectoryDataset(args.hdf5, ctx_frames=0)
-    print(f"Dataset: {len(dataset)} samples from {args.hdf5}")
+    dataset = TrajectoryDataset(args.hdf5, ctx_frames=args.ctx_frames)
+    print(f"Dataset: {len(dataset)} samples from {args.hdf5}  ctx_frames={args.ctx_frames}")
 
     # 90/10 train/val split
     val_size = max(1, len(dataset) // 10)
@@ -227,9 +235,12 @@ def train(args):
         num_batches = 0
 
         for batch in train_loader:
-            x_1       = batch["x_1"].to(device, non_blocking=True)
-            cond      = batch["cond"].to(device, non_blocking=True)       # [B, 7]
-            cube_pos  = batch["cube_pos"].to(device, non_blocking=True)   # [B, 3]
+            x_1      = batch["x_1"].to(device, non_blocking=True)
+            cond     = batch["cond"].to(device, non_blocking=True)      # [B, 7]
+            cube_pos = batch["cube_pos"].to(device, non_blocking=True)  # [B, 3]
+            ctx      = batch.get("ctx_latents")
+            if ctx is not None:
+                ctx = ctx.to(device, non_blocking=True)                 # [B, n_ctx, 16, 8, 8]
             B = x_1.shape[0]
 
             # --- CFM forward (inline for efficiency) ---
@@ -240,7 +251,8 @@ def train(args):
                     t_exp = t.view(B, 1, 1, 1)
                     x_t = (1 - t_exp) * x_0 + t_exp * x_1
                     v_target = x_1 - x_0
-                    v_pred, cube_pos_pred = model(x_t, t, cond, return_aux=True)
+                    v_pred, cube_pos_pred = model(x_t, t, cond,
+                                                  ctx_latents=ctx, return_aux=True)
                     loss_cfm = F.mse_loss(v_pred, v_target)
                     loss_aux = F.mse_loss(cube_pos_pred, cube_pos)
                     loss = loss_cfm + 0.1 * loss_aux
@@ -300,15 +312,18 @@ def train(args):
                     for i, vbatch in enumerate(val_loader):
                         if i >= args.val_batches:
                             break
-                        vx1  = vbatch["x_1"].to(device, non_blocking=True)
+                        vx1   = vbatch["x_1"].to(device, non_blocking=True)
                         vcond = vbatch["cond"].to(device, non_blocking=True)
+                        vctx  = vbatch.get("ctx_latents")
+                        if vctx is not None:
+                            vctx = vctx.to(device, non_blocking=True)
                         vB = vx1.shape[0]
                         vt = torch.rand(vB, device=device)
                         vx0 = torch.randn_like(vx1)
                         vt_exp = vt.view(vB, 1, 1, 1)
                         vx_t = (1 - vt_exp) * vx0 + vt_exp * vx1
                         vv_target = vx1 - vx0
-                        vv_pred = model(vx_t, vt, vcond)
+                        vv_pred = model(vx_t, vt, vcond, ctx_latents=vctx)
                         val_losses.append(F.mse_loss(vv_pred, vv_target).item())
 
                 val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
@@ -381,7 +396,9 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, global_step, pat
 def parse_args():
     p = argparse.ArgumentParser(description="DiT + CFM training")
     # Data
-    p.add_argument("--hdf5", type=str, default="trajectories_10k.h5")
+    p.add_argument("--hdf5", type=str, default="trajectories_10k_v2.h5")
+    p.add_argument("--ctx_frames", type=int, default=4,
+                   help="Context frames fed to the model during training (0 disables)")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
     # Training
