@@ -418,30 +418,36 @@ class HDF5Writer:
     def ensure_episode(self, env_id: int):
         if env_id not in self._buffers:
             self._buffers[env_id] = {
-                "latents": [], "actions": [], "rewards": [], "dones": [],
+                "latents": [], "actions": [], "rewards": [],
+                "terminated": [], "truncated": [], "success": [],
                 "ee_pos": [], "cube_pos": [], "phase": [],
             }
 
     def append_frame(self, env_id: int, latent: np.ndarray,
-                     action: np.ndarray, reward: float, done: bool,
+                     action: np.ndarray, reward: float,
+                     terminated: bool, truncated: bool, success: bool,
                      ee_pos: np.ndarray, cube_pos: np.ndarray, phase: int):
         buf = self._buffers[env_id]
         buf["latents"].append(latent)
         buf["actions"].append(action)
         buf["rewards"].append(reward)
-        buf["dones"].append(done)
+        buf["terminated"].append(terminated)
+        buf["truncated"].append(truncated)
+        buf["success"].append(success)
         buf["ee_pos"].append(ee_pos)
         buf["cube_pos"].append(cube_pos)
         buf["phase"].append(phase)
 
     def append_batch(self, latents: np.ndarray, actions: np.ndarray,
-                     rewards: np.ndarray, dones: np.ndarray,
+                     rewards: np.ndarray, terminated: np.ndarray,
+                     truncated: np.ndarray, success: np.ndarray,
                      ee_pos: np.ndarray, cube_pos: np.ndarray,
                      phases: np.ndarray, num_envs: int):
         for i in range(num_envs):
             self.ensure_episode(i)
             self.append_frame(i, latents[i], actions[i],
-                              float(rewards[i]), bool(dones[i]),
+                              float(rewards[i]),
+                              bool(terminated[i]), bool(truncated[i]), bool(success[i]),
                               ee_pos[i], cube_pos[i], int(phases[i]))
 
     def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
@@ -450,13 +456,15 @@ class HDF5Writer:
             return
         T = len(buf["latents"])
         grp = self.h5file.create_group(f"episode_{self._episode_count:04d}")
-        lat_arr      = np.stack(buf["latents"],   axis=0).astype(np.float16)
-        act_arr      = np.stack(buf["actions"],   axis=0).astype(np.float32)
-        rew_arr      = np.array(buf["rewards"],   dtype=np.float32)
-        done_arr     = np.array(buf["dones"],     dtype=bool)
-        ee_pos_arr   = np.stack(buf["ee_pos"],    axis=0).astype(np.float32)
-        cube_pos_arr = np.stack(buf["cube_pos"],  axis=0).astype(np.float32)
-        phase_arr    = np.array(buf["phase"],     dtype=np.int8)
+        lat_arr      = np.stack(buf["latents"],    axis=0).astype(np.float16)
+        act_arr      = np.stack(buf["actions"],    axis=0).astype(np.float32)
+        rew_arr      = np.array(buf["rewards"],    dtype=np.float32)
+        term_arr     = np.array(buf["terminated"], dtype=bool)
+        trunc_arr    = np.array(buf["truncated"],  dtype=bool)
+        succ_arr     = np.array(buf["success"],    dtype=bool)
+        ee_pos_arr   = np.stack(buf["ee_pos"],     axis=0).astype(np.float32)
+        cube_pos_arr = np.stack(buf["cube_pos"],   axis=0).astype(np.float32)
+        phase_arr    = np.array(buf["phase"],      dtype=np.int8)
         C = self.CHUNK_T
         grp.create_dataset("latents", data=lat_arr,
                            chunks=(min(C, T), *lat_arr.shape[1:]),
@@ -464,15 +472,17 @@ class HDF5Writer:
         grp.create_dataset("actions", data=act_arr,
                            chunks=(min(C, T), self.action_dim),
                            compression="lzf")
-        grp.create_dataset("rewards", data=rew_arr,
-                           chunks=(min(C, T),), compression="lzf")
-        grp.create_dataset("dones",    data=done_arr,     chunks=(min(C, T),))
+        grp.create_dataset("rewards",    data=rew_arr,   chunks=(min(C, T),), compression="lzf")
+        grp.create_dataset("terminated", data=term_arr,  chunks=(min(C, T),))
+        grp.create_dataset("truncated",  data=trunc_arr, chunks=(min(C, T),))
+        grp.create_dataset("success",    data=succ_arr,  chunks=(min(C, T),))
         grp.create_dataset("ee_pos",   data=ee_pos_arr,   chunks=(min(C, T), 3),
                            compression="lzf")
         grp.create_dataset("cube_pos", data=cube_pos_arr, chunks=(min(C, T), 3),
                            compression="lzf")
         grp.create_dataset("phase",    data=phase_arr,    chunks=(min(C, T),),
                            compression="lzf")
+        grp.attrs["episode_id"] = self._episode_count
         grp.attrs["length"] = T
         grp.attrs["completed"] = completed
         grp.attrs["task"] = task
@@ -512,8 +522,8 @@ def _hdf5_writer_process(path: str, action_dim: int, metadata: dict,
                 break
             cmd = msg[0]
             if cmd == "append":
-                _, latents, actions, rewards, dones, ee_pos, cube_pos, phases, num_envs = msg
-                writer.append_batch(latents, actions, rewards, dones,
+                _, latents, actions, rewards, terminated, truncated, success, ee_pos, cube_pos, phases, num_envs = msg
+                writer.append_batch(latents, actions, rewards, terminated, truncated, success,
                                     ee_pos, cube_pos, phases, num_envs)
             elif cmd == "finalize":
                 _, env_id, task, seed, completed = msg
@@ -554,10 +564,11 @@ class AsyncHDF5Writer:
         self.queue.put(("ensure", env_id))
 
     def append_batch(self, latents: np.ndarray, actions: np.ndarray,
-                     rewards: np.ndarray, dones: np.ndarray,
+                     rewards: np.ndarray, terminated: np.ndarray,
+                     truncated: np.ndarray, success: np.ndarray,
                      ee_pos: np.ndarray, cube_pos: np.ndarray,
                      phases: np.ndarray, num_envs: int):
-        self.queue.put(("append", latents, actions, rewards, dones,
+        self.queue.put(("append", latents, actions, rewards, terminated, truncated, success,
                         ee_pos, cube_pos, phases, num_envs))
 
     def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
@@ -730,6 +741,12 @@ def run(cfg: IngestConfig):
                 cur_cube_pos = policy.last_cube_pos.cpu()  # [N, 3]
                 cur_phases   = policy.phases.cpu()         # [N]
                 obs, rewards, terms, truncs, infos = collector.step(actions)
+                # Extract per-env success flag from info dict
+                raw_success = infos.get("success", False)
+                if isinstance(raw_success, torch.Tensor):
+                    cur_success = raw_success.to(torch.bool).cpu()
+                else:
+                    cur_success = torch.zeros(cfg.num_envs, dtype=torch.bool)
                 bench.cuda_stop("env_step")
 
                 # --- 2. Preprocess into current buffer ---
@@ -745,7 +762,9 @@ def run(cfg: IngestConfig):
                     latents_cpu  = pending_latents.cpu().numpy()
                     actions_cpu  = prev_actions.cpu().numpy()
                     rewards_cpu  = prev_rewards.cpu().numpy()
-                    dones_cpu    = prev_dones.cpu().numpy()
+                    terms_cpu    = prev_terms.cpu().numpy()
+                    truncs_cpu   = prev_truncs.cpu().numpy()
+                    success_cpu  = prev_success.numpy()
                     ee_pos_cpu   = prev_ee_pos.numpy()
                     cube_pos_cpu = prev_cube_pos.numpy()
                     phases_cpu   = prev_phases.numpy()
@@ -753,7 +772,8 @@ def run(cfg: IngestConfig):
 
                     bench.cpu_start("hdf5_write")
                     writer.append_batch(latents_cpu, actions_cpu, rewards_cpu,
-                                        dones_cpu, ee_pos_cpu, cube_pos_cpu,
+                                        terms_cpu, truncs_cpu, success_cpu,
+                                        ee_pos_cpu, cube_pos_cpu,
                                         phases_cpu, num_envs=cfg.num_envs)
                     bench.cpu_stop("hdf5_write")
 
@@ -785,6 +805,8 @@ def run(cfg: IngestConfig):
                 prev_actions   = actions
                 prev_rewards   = rewards
                 prev_terms     = terms
+                prev_truncs    = truncs
+                prev_success   = cur_success
                 prev_dones     = terms | truncs
                 prev_ee_pos    = cur_ee_pos
                 prev_cube_pos  = cur_cube_pos
@@ -798,12 +820,15 @@ def run(cfg: IngestConfig):
                 latents_cpu  = pending_latents.cpu().numpy()
                 actions_cpu  = prev_actions.cpu().numpy()
                 rewards_cpu  = prev_rewards.cpu().numpy()
-                dones_cpu    = prev_dones.cpu().numpy()
+                terms_cpu    = prev_terms.cpu().numpy()
+                truncs_cpu   = prev_truncs.cpu().numpy()
+                success_cpu  = prev_success.numpy()
                 ee_pos_cpu   = prev_ee_pos.numpy()
                 cube_pos_cpu = prev_cube_pos.numpy()
                 phases_cpu   = prev_phases.numpy()
                 writer.append_batch(latents_cpu, actions_cpu, rewards_cpu,
-                                    dones_cpu, ee_pos_cpu, cube_pos_cpu,
+                                    terms_cpu, truncs_cpu, success_cpu,
+                                    ee_pos_cpu, cube_pos_cpu,
                                     phases_cpu, num_envs=cfg.num_envs)
                 step_count += 1
                 done_indices = prev_dones.nonzero(as_tuple=False).squeeze(-1)

@@ -145,13 +145,21 @@ def worker(
                     break
 
                 # 1. step
-                actions                          = policy()
+                actions                            = policy()
                 # Capture proprioceptive state right after policy() call
                 ee_pos_np   = policy.last_ee_pos[0].cpu().numpy()    # [3]
                 cube_pos_np = policy.last_cube_pos[0].cpu().numpy()  # [3]
                 phase_int   = int(policy.phases[0].item())
-                obs, rewards, terms, truncs, _  = collector.step(actions)
-                done = bool((terms | truncs)[0].item())
+                obs, rewards, terms, truncs, infos = collector.step(actions)
+                terminated = bool(terms[0].item())
+                truncated  = bool(truncs[0].item())
+                raw_success = infos.get("success", False)
+                success = bool(
+                    raw_success[0].item()
+                    if isinstance(raw_success, torch.Tensor)
+                    else raw_success
+                )
+                done = terminated or truncated
 
                 # 2. extract RGB → send to encoder server
                 collector.extract_rgb(obs, frame_buf)
@@ -166,7 +174,9 @@ def worker(
                     latent=latent_np,
                     action=actions[0].cpu().numpy(),
                     reward=float(rewards[0]),
-                    done=done,
+                    terminated=terminated,
+                    truncated=truncated,
+                    success=success,
                     ee_pos=ee_pos_np,
                     cube_pos=cube_pos_np,
                     phase=phase_int,

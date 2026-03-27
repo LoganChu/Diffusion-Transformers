@@ -18,8 +18,8 @@ def sample_ode_cached(
     Args:
         model: DiTSmall instance (should be in eval mode, float16)
         ctx_latents: [B, n_ctx_frames, 16, 8, 8] context frames
-        ctx_actions: [B, 7] most recent context cond vector [dx,dy,dz,gripper,ee_x,ee_y,ee_z]
-        action: [B, 7] cond vector for the predicted frame
+        ctx_actions: [B, 4] most recent context cond vector [dx,dy,dz,gripper]
+        action: [B, 4] cond vector for the predicted frame
         num_steps: number of Euler ODE steps
     Returns:
         [B, 16, 8, 8] predicted latent frame

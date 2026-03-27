@@ -236,7 +236,7 @@ def train(args):
 
         for batch in train_loader:
             x_1      = batch["x_1"].to(device, non_blocking=True)
-            cond     = batch["cond"].to(device, non_blocking=True)      # [B, 7]
+            cond     = batch["cond"].to(device, non_blocking=True)      # [B, 4]
             cube_pos = batch["cube_pos"].to(device, non_blocking=True)  # [B, 3]
             ctx      = batch.get("ctx_latents")
             if ctx is not None:

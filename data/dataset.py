@@ -75,8 +75,9 @@ class TrajectoryDataset(Dataset):
             cube_pos = torch.zeros(3)
             phase    = -1
 
-        # 7D conditioning vector: [dx, dy, dz, gripper, ee_x, ee_y, ee_z]
-        cond = torch.cat([action, ee_pos])
+        # 4D conditioning vector: [dx, dy, dz, gripper]
+        # ee_pos is stored separately in HDF5 and does not need to be duplicated here
+        cond = action
 
         result = {
             "x_1":      x_1,

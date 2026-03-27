@@ -34,7 +34,7 @@ def parse_args():
                    help="Path to merged HDF5 file")
     p.add_argument("--n",     type=int, default=30,
                    help="Number of episodes to sample")
-    p.add_argument("--color", choices=["reward", "phase", "gripper", "episode"],
+    p.add_argument("--color", choices=["reward", "phase", "gripper", "episode", "success"],
                    default="phase",
                    help="What to color trajectories by")
     p.add_argument("--seed",  type=int, default=0)
@@ -44,6 +44,8 @@ def parse_args():
                    help="Open browser after rendering (default True)")
     p.add_argument("--completed_only", action="store_true", default=False,
                    help="Only visualize episodes where the task was completed")
+    p.add_argument("--success_only", action="store_true", default=False,
+                   help="Only visualize episodes that contain at least one success step")
     return p.parse_args()
 
 
@@ -96,27 +98,39 @@ PHASE_NAMES  = ["Approach", "Descend", "Grasp", "Lift"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Load episodes
 # ─────────────────────────────────────────────────────────────────────────────
-def load_episodes(hdf5_path: str, n: int, seed: int, completed_only: bool):
+def load_episodes(hdf5_path: str, n: int, seed: int,
+                  completed_only: bool, success_only: bool):
     with h5py.File(hdf5_path, "r") as f:
         keys = [k for k in f.keys() if k.startswith("episode_")]
 
         if completed_only:
-            keys = [k for k in keys if f[k].attrs.get("completed", True)]
+            keys = [k for k in keys if f[k].attrs.get("completed", False)]
+
+        if success_only:
+            keys = [k for k in keys if "success" in f[k] and f[k]["success"][:].any()]
 
         random.seed(seed)
         sampled = random.sample(keys, min(n, len(keys)))
 
         episodes = []
         for k in sampled:
-            grp = f[k]
-            actions = grp["actions"][:]          # [T, 4]  float32
-            rewards = grp["rewards"][:]          # [T]     float32
+            grp      = f[k]
+            actions   = grp["actions"][:]                        # [T, 4]  float32
+            rewards   = grp["rewards"][:]                        # [T]     float32
             completed = bool(grp.attrs.get("completed", False))
+            episode_id = int(grp.attrs.get("episode_id", -1))
+            # success: per-step bool array; falls back to all-False for old HDF5
+            if "success" in grp:
+                success = grp["success"][:]                      # [T]     bool
+            else:
+                success = np.zeros(len(rewards), dtype=bool)
             episodes.append({
-                "key": k,
-                "actions": actions,
-                "rewards": rewards,
-                "completed": completed,
+                "key":        k,
+                "episode_id": episode_id,
+                "actions":    actions,
+                "rewards":    rewards,
+                "success":    success,
+                "completed":  completed,
             })
 
     print(f"Loaded {len(episodes)} episodes from {hdf5_path}")
@@ -216,6 +230,26 @@ def make_traces(episodes: list[dict], color_by: str) -> list:
                 name=label,
             ))
 
+        elif color_by == "success":
+            # Green where success=True, grey elsewhere
+            success = ep["success"].astype(np.float32)   # [T]
+            traces.append(go.Scatter3d(
+                x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+                mode="lines+markers",
+                marker=dict(
+                    size=2, color=success,
+                    colorscale=[[0, "grey"], [1, "#6AC16A"]],
+                    showscale=(ep_idx == 0),
+                    colorbar=dict(title="Success", thickness=15,
+                                  tickvals=[0, 1], ticktext=["No", "Yes"])
+                    if ep_idx == 0 else None,
+                    cmin=0, cmax=1,
+                ),
+                line=dict(color="rgba(150,150,150,0.3)", width=1),
+                showlegend=False,
+                name=ep["key"],
+            ))
+
     return traces
 
 
@@ -231,7 +265,7 @@ def main():
         sys.exit(1)
 
     episodes = load_episodes(
-        str(hdf5_path), args.n, args.seed, args.completed_only
+        str(hdf5_path), args.n, args.seed, args.completed_only, args.success_only
     )
     if not episodes:
         print("No episodes matched the filter.")

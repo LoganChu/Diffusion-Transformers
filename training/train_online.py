@@ -1,0 +1,504 @@
+"""Online model-based RL training loop.
+
+Phases
+------
+1. Seed the replay buffer from offline HDF5 (heuristic rewards via env/reward.py).
+2. Warm-start the model from a pretrained offline checkpoint (recommended).
+3. Main loop:
+   a. Collect one episode with the CEM planner in the real ManiSkill env.
+   b. Push transitions — labelled with env.step() rewards — into the replay buffer.
+   c. Run K gradient updates on sampled replay batches (world model + task heads).
+   d. Periodically evaluate success rate and save checkpoints.
+
+Usage
+-----
+    # Warm-start from offline checkpoint, run 500 online episodes
+    python -m training.train_online \
+        --hdf5        trajectories_10k_v2.h5 \
+        --resume      checkpoints/best.pt \
+        --n_episodes  500
+
+    # From scratch (slower convergence)
+    python -m training.train_online --n_episodes 1000
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import math
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import mani_skill.envs   # noqa: F401 — register ManiSkill envs
+import gymnasium as gym
+from torch.profiler import record_function
+
+from data.replay       import ReplayBuffer
+from inference.planner import cem_plan, cube_height_score_fn
+from models.dit        import ACTION_DIM, DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W
+from training.loss     import WorldModelLoss
+
+
+# ---------------------------------------------------------------------------
+# Cosmos encoder
+# ---------------------------------------------------------------------------
+
+def load_encoder(ckpt_dir: str, device: torch.device):
+    """Load the Cosmos-Tokenizer-CI16x16 encoder JIT model."""
+    from data.ingest import ensure_cosmos_weights, CosmosLatentEncoder
+    ensure_cosmos_weights(ckpt_dir)
+    return CosmosLatentEncoder(ckpt_dir)
+
+
+@torch.no_grad()
+def encode_frame(encoder, frame_hwc: np.ndarray | torch.Tensor) -> torch.Tensor:
+    """Encode a single [H, W, 3] uint8 frame → [1, 16, 8, 8] float16 latent.
+
+    Handles the [1, H, W, 3] batched output that ManiSkill returns for
+    num_envs=1 by squeezing the leading dimension before encoding.
+    """
+    if isinstance(frame_hwc, np.ndarray):
+        frame_hwc = torch.from_numpy(frame_hwc)
+    if frame_hwc.dim() == 4:
+        frame_hwc = frame_hwc[0]                       # [H, W, 3]
+    frame = frame_hwc[..., :3].permute(2, 0, 1).float().div_(255.0)  # [3, H, W]
+    if frame.shape[-2:] != (128, 128):
+        frame = F.interpolate(
+            frame.unsqueeze(0), size=(128, 128), mode="bilinear", align_corners=False
+        ).squeeze(0)
+    buf = frame.unsqueeze(0).to(torch.float16)         # [1, 3, 128, 128]
+    latent = encoder.encode(buf)                        # [1, 16, 8, 8]
+    encoder.sync()
+    return latent.to(torch.float16)
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def make_env(control_mode: str = "pd_ee_delta_pos") -> gym.Env:
+    return gym.make(
+        "PickCube-v1",
+        num_envs=1,
+        obs_mode="state",
+        render_mode="rgb_array",
+        render_backend="cpu",
+        control_mode=control_mode,
+    )
+
+
+def parse_success(info: dict) -> bool:
+    """Extract scalar success flag from ManiSkill info dict."""
+    s = info.get("success", False)
+    if isinstance(s, torch.Tensor):
+        return bool(s.any().item())
+    return bool(s)
+
+
+def parse_reward(reward) -> float:
+    if isinstance(reward, torch.Tensor):
+        return float(reward[0].item())
+    if hasattr(reward, "__len__"):
+        return float(reward[0])
+    return float(reward)
+
+
+# ---------------------------------------------------------------------------
+# Episode collection
+# ---------------------------------------------------------------------------
+
+def collect_episode(
+    env,
+    model:   nn.Module,
+    encoder,
+    replay:  ReplayBuffer,
+    args,
+    device:  torch.device,
+) -> dict:
+    """Run one episode with the CEM planner and push transitions to replay.
+
+    Exploration noise is added on top of the planned action so the agent
+    visits states outside the planner's current knowledge.
+
+    Returns a stats dict with keys: steps, total_reward, success.
+    """
+    model.eval()
+    obs, _info = env.reset()
+
+    ctx_deque: collections.deque[torch.Tensor] = collections.deque(maxlen=args.n_ctx)
+
+    ep_latents:    list[torch.Tensor] = []   # [16, 8, 8] float16
+    ep_a_conds:    list[torch.Tensor] = []   # [4] float32
+    ep_rewards:    list[float]        = []
+    ep_terminated: list[bool]         = []
+    ep_truncated:  list[bool]         = []
+    ep_success_t:  list[bool]         = []   # per-step success flag
+    ep_success                        = False
+
+    for _ in range(args.max_steps):
+        # ---- Encode current observation ----
+        frame   = env.render()                         # [1, H, W, 3] uint8
+        z_t     = encode_frame(encoder, frame)         # [1, 16, 8, 8] float16
+        z_t_dev = z_t.to(device)
+
+        ctx_deque.append(z_t_dev.squeeze(0))           # [16, 8, 8]
+
+        # ---- Build [1, n_ctx, 16, 8, 8] context with zero-padding ----
+        frames  = list(ctx_deque)
+        n_have  = len(frames)
+        if n_have < args.n_ctx:
+            pad    = [torch.zeros_like(frames[0])] * (args.n_ctx - n_have)
+            frames = pad + frames
+        ctx_input = torch.stack(frames, dim=0).unsqueeze(0)    # [1, n_ctx, 16, 8, 8]
+        ctx_act   = torch.zeros(1, ACTION_DIM, device=device, dtype=torch.float16)
+
+        # ---- Plan ----
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+            a_4d = cem_plan(
+                model,
+                ctx_input,
+                ctx_act,
+                score_fn      = cube_height_score_fn,
+                horizon       = args.horizon,
+                n_candidates  = args.n_candidates,
+                n_elites      = args.n_elites,
+                n_cem_iters   = args.n_cem_iters,
+                num_ode_steps = args.num_ode_steps,
+            )   # [4] float32
+
+        # ---- Exploration noise ----
+        if args.expl_noise > 0:
+            noise = torch.randn_like(a_4d) * args.expl_noise
+            a_4d  = (a_4d + noise).clamp(-0.08, 0.08)
+
+        # ---- Step environment ----
+        action_np = a_4d.cpu().numpy().reshape(1, -1)      # [1, 4] for num_envs=1
+        obs, reward, terminated, truncated, info = env.step(action_np)
+        step_success = parse_success(info)
+        done = bool(terminated or truncated)
+        r    = parse_reward(reward)
+        if step_success:
+            ep_success = True
+
+        ep_latents.append(z_t.squeeze(0).cpu())
+        ep_a_conds.append(a_4d.cpu())                  # [4] — pure action, no ee_pos
+        ep_rewards.append(r)
+        ep_terminated.append(bool(terminated))
+        ep_truncated.append(bool(truncated))
+        ep_success_t.append(step_success)
+
+        if done:
+            break
+
+    # ---- Push episode to replay ----
+    if len(ep_latents) > 1:
+        replay.push_episode(
+            latents    = torch.stack(ep_latents).to(torch.float16),
+            a_conds    = torch.stack(ep_a_conds),
+            rewards    = torch.tensor(ep_rewards,    dtype=torch.float32),
+            terminated = torch.tensor(ep_terminated, dtype=torch.bool),
+            truncated  = torch.tensor(ep_truncated,  dtype=torch.bool),
+            success    = torch.tensor(ep_success_t,  dtype=torch.bool),
+        )
+
+    model.train()
+    return {
+        "steps":        len(ep_latents),
+        "total_reward": sum(ep_rewards),
+        "success":      ep_success,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Evaluation (no exploration noise, no gradient)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(
+    env,
+    model:   nn.Module,
+    encoder,
+    args,
+    device:  torch.device,
+) -> dict:
+    """Run args.eval_episodes greedy episodes and return success rate + mean reward."""
+    model.eval()
+    successes    = 0
+    total_reward = 0.0
+
+    for _ in range(args.eval_episodes):
+        obs, _info = env.reset()
+        ctx_deque: collections.deque[torch.Tensor] = collections.deque(maxlen=args.n_ctx)
+        ep_reward  = 0.0
+
+        for _ in range(args.max_steps):
+            frame   = env.render()
+            z_t     = encode_frame(encoder, frame).to(device)
+            ctx_deque.append(z_t.squeeze(0))
+
+            frames = list(ctx_deque)
+            n_have = len(frames)
+            if n_have < args.n_ctx:
+                pad    = [torch.zeros_like(frames[0])] * (args.n_ctx - n_have)
+                frames = pad + frames
+            ctx_input = torch.stack(frames, dim=0).unsqueeze(0)
+            ctx_act   = torch.zeros(1, ACTION_DIM, device=device, dtype=torch.float16)
+
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                a_4d = cem_plan(
+                    model, ctx_input, ctx_act,
+                    score_fn      = cube_height_score_fn,
+                    horizon       = args.horizon,
+                    n_candidates  = args.n_candidates,
+                    n_elites      = args.n_elites,
+                    n_cem_iters   = args.n_cem_iters,
+                    num_ode_steps = args.num_ode_steps,
+                )
+
+            obs, reward, terminated, truncated, info = env.step(
+                a_4d.cpu().numpy().reshape(1, -1)
+            )
+            ep_reward += parse_reward(reward)
+
+            if parse_success(info):
+                successes += 1
+                break
+            if bool(terminated or truncated):
+                break
+
+        total_reward += ep_reward
+
+    model.train()
+    n = args.eval_episodes
+    return {
+        "success_rate": successes / n,
+        "mean_reward":  total_reward / n,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(model, optimizer, scheduler, scaler, episode, path):
+    torch.save(
+        {
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler":    scaler.state_dict(),
+            "episode":   episode,
+        },
+        path,
+    )
+    print(f"  >> saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# Main online training loop
+# ---------------------------------------------------------------------------
+
+def train_online(args):
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda")
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+
+    # ---- WandB (optional) ----
+    run = None
+    if not args.no_wandb:
+        import wandb
+        run = wandb.init(
+            project  = args.wandb_project,
+            name     = args.wandb_run_name,
+            config   = vars(args),
+        )
+
+    # ---- Model ----
+    model = DiTSmall().to(device)
+    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+
+    if args.resume and os.path.isfile(args.resume):
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        print(f"Loaded weights from {args.resume}")
+
+    # ---- Optimizer / scheduler ----
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr           = args.lr,
+        betas        = (0.9, 0.95),
+        weight_decay = args.weight_decay,
+    )
+    total_updates = args.n_episodes * args.updates_per_ep
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_updates), eta_min=args.lr * 0.1
+    )
+
+    use_bf16  = torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler    = torch.amp.GradScaler("cuda", enabled=not use_bf16)
+
+    # ---- Loss ----
+    loss_fn = WorldModelLoss()
+
+    # ---- Replay buffer ----
+    replay = ReplayBuffer(
+        capacity   = args.replay_capacity,
+        n_ctx      = args.n_ctx,
+        action_dim = 7,
+        gamma      = args.gamma,
+    )
+    if args.hdf5:
+        replay.seed_from_hdf5(args.hdf5)
+
+    # ---- Encoder + environment ----
+    encoder = load_encoder(args.cosmos_ckpt, device)
+    env     = make_env()
+
+    # ---- Training loop ----
+    best_success_rate = 0.0
+    global_update     = 0
+
+    for episode in range(args.n_episodes):
+        # -- Collect --
+        ep_stats = collect_episode(env, model, encoder, replay, args, device)
+
+        # -- Update (skip if replay too small) --
+        update_stats: dict[str, float] = {}
+        if len(replay) >= args.min_replay_size:
+            accum: dict[str, float] = collections.defaultdict(float)
+            for _ in range(args.updates_per_ep):
+                batch = replay.sample(args.batch_size, device=device)
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    loss, loss_dict = loss_fn(model, batch)
+
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                global_update += 1
+
+                for k, v in loss_dict.items():
+                    accum[k] += v / args.updates_per_ep
+
+            update_stats = dict(accum)
+
+        # -- Logging --
+        if (episode + 1) % args.log_every == 0:
+            lr  = optimizer.param_groups[0]["lr"]
+            mem = torch.cuda.max_memory_allocated() / 1024 ** 2
+            print(
+                f"[ep {episode+1:>4d}]  "
+                f"steps={ep_stats['steps']:>3d}  "
+                f"r={ep_stats['total_reward']:>6.2f}  "
+                f"success={ep_stats['success']}  "
+                f"replay={len(replay):,}  "
+                + (f"loss={update_stats.get('loss', 0):.4f}  " if update_stats else "")
+                + f"lr={lr:.2e}  mem={mem:.0f}MB"
+            )
+            if run is not None:
+                log = {
+                    "collect/steps":        ep_stats["steps"],
+                    "collect/total_reward": ep_stats["total_reward"],
+                    "collect/success":      int(ep_stats["success"]),
+                    "replay/size":          len(replay),
+                    "train/lr":             lr,
+                    "gpu/mem_peak_mb":      mem,
+                }
+                log.update({f"train/{k}": v for k, v in update_stats.items()})
+                run.log(log, step=episode + 1)
+
+        # -- Evaluate + checkpoint --
+        if (episode + 1) % args.eval_every == 0 and len(replay) >= args.min_replay_size:
+            eval_stats = evaluate(env, model, encoder, args, device)
+            sr = eval_stats["success_rate"]
+            print(
+                f"  >> eval  success_rate={sr:.1%}  "
+                f"mean_reward={eval_stats['mean_reward']:.2f}"
+            )
+            if run is not None:
+                run.log(
+                    {
+                        "eval/success_rate": sr,
+                        "eval/mean_reward":  eval_stats["mean_reward"],
+                    },
+                    step=episode + 1,
+                )
+            if sr > best_success_rate:
+                best_success_rate = sr
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, episode,
+                    os.path.join(args.ckpt_dir, "online_best.pt"),
+                )
+                print(f"  >> new best success_rate={sr:.1%}")
+
+        # Periodic checkpoint
+        if (episode + 1) % args.save_every == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, scaler, episode,
+                os.path.join(args.ckpt_dir, f"online_ep{episode+1:05d}.pt"),
+            )
+
+    env.close()
+    save_checkpoint(
+        model, optimizer, scheduler, scaler, args.n_episodes - 1,
+        os.path.join(args.ckpt_dir, "online_final.pt"),
+    )
+    if run is not None:
+        run.finish()
+    print(f"Done. Best success rate: {best_success_rate:.1%}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Online MBRL training loop")
+    # Data
+    p.add_argument("--hdf5",             type=str,   default="trajectories_10k_v2.h5")
+    p.add_argument("--cosmos_ckpt",      type=str,   default="pretrained_ckpts/Cosmos-Tokenizer-CI16x16")
+    p.add_argument("--resume",           type=str,   default=None)
+    # Replay
+    p.add_argument("--replay_capacity",  type=int,   default=50_000)
+    p.add_argument("--min_replay_size",  type=int,   default=1_000)
+    p.add_argument("--n_ctx",            type=int,   default=4)
+    p.add_argument("--gamma",            type=float, default=0.99)
+    # Collection
+    p.add_argument("--n_episodes",       type=int,   default=500)
+    p.add_argument("--max_steps",        type=int,   default=200)
+    p.add_argument("--expl_noise",       type=float, default=0.02)
+    # Planner
+    p.add_argument("--horizon",          type=int,   default=6)
+    p.add_argument("--n_candidates",     type=int,   default=32)
+    p.add_argument("--n_elites",         type=int,   default=6)
+    p.add_argument("--n_cem_iters",      type=int,   default=3)
+    p.add_argument("--num_ode_steps",    type=int,   default=4)
+    # Training
+    p.add_argument("--updates_per_ep",   type=int,   default=20)
+    p.add_argument("--batch_size",       type=int,   default=128)
+    p.add_argument("--lr",               type=float, default=3e-4)
+    p.add_argument("--weight_decay",     type=float, default=0.05)
+    p.add_argument("--seed",             type=int,   default=42)
+    # Evaluation
+    p.add_argument("--eval_every",       type=int,   default=20)
+    p.add_argument("--eval_episodes",    type=int,   default=10)
+    # Logging / checkpoints
+    p.add_argument("--log_every",        type=int,   default=5)
+    p.add_argument("--save_every",       type=int,   default=50)
+    p.add_argument("--ckpt_dir",         type=str,   default="checkpoints")
+    p.add_argument("--no_wandb",         action="store_true")
+    p.add_argument("--wandb_project",    type=str,   default="optiworld-online")
+    p.add_argument("--wandb_run_name",   type=str,   default=None)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    train_online(parse_args())
