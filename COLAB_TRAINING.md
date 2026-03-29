@@ -58,28 +58,11 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     --log_every 50 \
     --num_workers 4 \
     --wandb_project optiworld-dit \
-    --wandb_run_name "a100-cfm-7k"
+    --wandb_run_name "a100-cfm-7k" \
+    --compile
 ```
 
-### Optional: torch.compile for ~20% speedup
-
-Wrap the model with `torch.compile` before training. Add this cell before launching:
-
-```python
-import torch
-from models.dit import DiTSmall
-
-model = DiTSmall().cuda()
-model = torch.compile(model, mode="max-autotune")
-# then pass to training.train or patch it in directly
-```
-
-Or set the env variable before the training command:
-```bash
-TORCH_COMPILE=1 python -m training.train ...
-```
-
-Note: `torch.compile` adds ~2-5 min compilation overhead on first step but then runs faster for the rest of training.
+`--compile` enables `torch.compile(mode="max-autotune")` for ~20% speedup. Adds ~2–5 min overhead on the first step. Drop the flag if you hit compile errors.
 
 ### Tuning Tips
 

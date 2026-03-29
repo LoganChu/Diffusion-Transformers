@@ -191,6 +191,10 @@ def train(args):
     # ---- Model ----
     model = DiTSmall().to(device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+    if args.compile:
+        print("Compiling model with torch.compile(mode='max-autotune') ...")
+        model = torch.compile(model, mode="max-autotune")
+        print("Compilation done.")
 
     # ---- Optimizer + Scheduler ----
     optimizer = torch.optim.AdamW(
@@ -420,6 +424,8 @@ def parse_args():
     p.add_argument("--gif_dir", type=str, default="val_gifs")
     p.add_argument("--save_every_epochs", type=int, default=10)
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--compile", action="store_true",
+                   help="Wrap model with torch.compile(mode='max-autotune') for ~20%% speedup on A100.")
     return p.parse_args()
 
 
