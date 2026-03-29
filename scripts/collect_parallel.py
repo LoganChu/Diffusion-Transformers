@@ -96,7 +96,7 @@ def encoder_server(
         frames_t   = torch.from_numpy(frames_np).cuda()
         latents_t  = encoder.encode(frames_t)
         encoder.sync()
-        latents_np = latents_t.cpu().numpy()                    # [B,16,8,8] f16
+        latents_np = latents_t.cpu().numpy()                    # [B,16,8,8] f32
 
         # --- fan out --------------------------------------------------------
         for i, wid in enumerate(worker_ids):
@@ -208,7 +208,7 @@ def worker(
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--num_workers",          type=int,   default=16)
+    p.add_argument("--num_workers",          type=int,   default=8)
     p.add_argument("--episodes_per_worker",  type=int,   default=1250)
     p.add_argument("--max_steps",            type=int,   default=400)
     p.add_argument("--shard_dir",            type=str,   default="trajectories_shards")

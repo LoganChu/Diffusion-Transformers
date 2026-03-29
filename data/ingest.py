@@ -391,7 +391,7 @@ class CosmosLatentEncoder:
     """Cosmos-Tokenizer-CI16x16 encoder with optional CUDA stream pipelining.
 
     Input:  [B, 3, 128, 128] float16 in [0,1]
-    Output: [B, 16, 8, 8]    float16
+    Output: [B, 16, 8, 8]    float32
     """
 
     def __init__(self, ckpt_dir: str):
@@ -415,7 +415,7 @@ class CosmosLatentEncoder:
                 (l2,) = self.encoder.encode(bf16_buf[mid:])
                 latents = torch.cat([l1, l2], dim=0)
                 self._halved = True
-        return latents.to(torch.float16)
+        return latents.to(torch.float32)
 
     def sync(self):
         """Wait for the encode stream to finish."""
@@ -499,7 +499,7 @@ class HDF5Writer:
             return
         T = len(buf["latents"])
         grp = self.h5file.create_group(f"episode_{self._episode_count:04d}")
-        lat_arr      = np.stack(buf["latents"],    axis=0).astype(np.float16)
+        lat_arr      = np.stack(buf["latents"],    axis=0).astype(np.float32)
         act_arr      = np.stack(buf["actions"],    axis=0).astype(np.float32)
         rew_arr      = np.array(buf["rewards"],    dtype=np.float32)
         term_arr     = np.array(buf["terminated"], dtype=bool)
