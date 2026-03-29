@@ -52,15 +52,18 @@ class IngestConfig:
     task: str = "PickCube-v1"
     num_envs: int = 128
     max_episodes: int = 100
-    max_steps: int = 200
+    max_steps: int = 400
     hdf5_path: str = "trajectories.h5"
     cosmos_ckpt: str = "pretrained_ckpts/Cosmos-Tokenizer-CI16x16"
     seed: int = 42
     flush_every: int = 50
     rdcc_nbytes: int = 64 * 1024 * 1024
     async_writer: bool = True  # use multiprocess HDF5 writer
-    noise_scale: float = 0.05
+    noise_scale: float = 0.13
     control_mode: str = "pd_ee_delta_pos"
+    sim_backend: str = "gpu"  # "gpu" or "cpu"; cpu requires num_envs=1 per process
+    robot_init_qpos_noise: float = 0.10   # std (rad) of shoulder/elbow noise (wrist is fixed)
+    cube_spawn_half_size: float = 0.15    # half-side (m) of cube/goal XY spawn region
 
     @property
     def max_total_steps(self) -> int:
@@ -97,14 +100,19 @@ class ManiSkillCollector:
         self.env: Optional[gym.Env] = None
 
     def __enter__(self):
-        self.env = gym.make(
-            self.cfg.task,
+        kwargs = dict(
             num_envs=self.cfg.num_envs,
             obs_mode="state",
             render_mode="rgb_array",
             render_backend="cpu",
             control_mode=self.cfg.control_mode,
+            max_episode_steps=self.cfg.max_steps,
+            robot_init_qpos_noise=self.cfg.robot_init_qpos_noise,
         )
+        if self.cfg.sim_backend == "cpu":
+            kwargs["sim_backend"] = "cpu"
+        self.env = gym.make(self.cfg.task, **kwargs)
+        self.env.unwrapped.cube_spawn_half_size = self.cfg.cube_spawn_half_size
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -114,7 +122,23 @@ class ManiSkillCollector:
         return False
 
     def reset(self):
-        return self.env.reset(seed=self.cfg.seed)
+        result = self.env.reset(seed=self.cfg.seed)
+        self._fix_wrist_orientation()
+        return result
+
+    def _fix_wrist_orientation(self):
+        """Reset Panda wrist joints (4-6) to canonical values after qpos noise.
+        Keeps shoulder/elbow noise (arm position diversity) but ensures the
+        gripper always points straight down for reliable grasping."""
+        uwenv = self.env.unwrapped
+        if getattr(uwenv, "robot_uids", None) not in ("panda", "panda_wristcam", None):
+            return  # only needed for Panda
+        # Canonical wrist qpos from TableSceneBuilder
+        _WRIST = torch.tensor([0.0, np.pi * 3 / 4, np.pi / 4],
+                               dtype=torch.float32, device=uwenv.device)
+        qpos = uwenv.agent.robot.get_qpos().clone()  # [N, 9]
+        qpos[:, 4:7] = _WRIST
+        uwenv.agent.robot.set_qpos(qpos)
 
     def step(self, actions: torch.Tensor):
         return self.env.step(actions)
@@ -155,25 +179,25 @@ class GuidedPolicy:
         0 = APPROACH  — move EE to (cube_xy, cube_z + HOVER_HEIGHT)
         1 = DESCEND   — move EE to (cube_xy, cube_z + NEAR_HEIGHT)
         2 = GRASP     — hold position, close gripper for GRASP_STEPS steps
-        3 = LIFT      — move EE upward by LIFT_DELTA per step
+        3 = LIFT      — move EE toward goal_pos (actual task goal marker)
+        4 = HOLD      — hold position at goal, gripper closed, until static → success
     """
 
     PHASE_APPROACH = 0
     PHASE_DESCEND  = 1
     PHASE_GRASP    = 2
     PHASE_LIFT     = 3
+    PHASE_HOLD     = 4
 
     HOVER_HEIGHT = 0.10    # metres above cube for APPROACH target
     NEAR_HEIGHT  = 0.00    # metres above cube for DESCEND target (TCP at cube centre)
-    LIFT_DELTA   = 0.05    # metres/step upward during LIFT
 
-    APPROACH_STEPS = 80
-    DESCEND_STEPS  = 150
-    GRASP_STEPS    = 40
-    LIFT_STEPS     = 50
+    GRASP_STEPS = 30
+    HOLD_STEPS  = 60
 
     APPROACH_THRESH = 0.04   # metres — triggers APPROACH→DESCEND early
     DESCEND_THRESH  = 0.008  # metres — triggers DESCEND→GRASP early
+    LIFT_THRESH     = 0.05   # metres z-distance — triggers LIFT→HOLD at goal height
 
     EE_GAIN    = 0.08   # max EE displacement per step (clamps delta before sending)
     GRIPPER_DIM = 3     # index of gripper action in 4D action vector
@@ -209,12 +233,15 @@ class GuidedPolicy:
         self._gripper_open  = float(self._hi[self.GRIPPER_DIM].item())
         self._gripper_close = float(self._lo[self.GRIPPER_DIM].item())
 
-        # Phase step budgets indexed by phase value
+        # Only GRASP and HOLD have real budgets; APPROACH/DESCEND/LIFT use proximity triggers
+        _INF = 10_000
         self._phase_budgets = torch.tensor(
-            [self.APPROACH_STEPS, self.DESCEND_STEPS,
-             self.GRASP_STEPS, self.LIFT_STEPS],
+            [_INF, _INF, self.GRASP_STEPS, _INF, self.HOLD_STEPS],
             dtype=torch.int32, device=self.device,
         )
+
+        # Probe goal position attribute (PickCube-v1 exposes goal_site)
+        self._goal_attr = "goal_site" if hasattr(env.unwrapped, "goal_site") else None
 
         # Pre-allocated buffers — zero allocation in __call__
         self._action_buf        = torch.zeros(num_envs, action_dim, dtype=torch.float32, device=self.device)
@@ -246,13 +273,20 @@ class GuidedPolicy:
         )
 
     def _get_ee_and_cube_pos(self):
-        """Returns (ee_pos, cube_pos) each [N, 3] float32 on self.device."""
+        """Returns (ee_pos, cube_pos, goal_pos) each [N, 3] float32 on self.device."""
         uwenv    = self.env.unwrapped
         ee_pos   = uwenv.agent.tcp.pose.p.to(self.device)
         cube_pos = getattr(uwenv, self._cube_attr).pose.p.to(self.device)
-        return ee_pos, cube_pos
+        if self._goal_attr is not None:
+            goal_pos = uwenv.goal_site.pose.p.to(self.device)
+        else:
+            # Fallback: target 0.2m above cube spawn if no goal marker
+            goal_pos = cube_pos.clone()
+            goal_pos[:, 2] = goal_pos[:, 2] + 0.20
+        return ee_pos, cube_pos, goal_pos
 
-    def _advance_phases(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor):
+    def _advance_phases(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor,
+                        goal_pos: torch.Tensor):
         """Update self.phases and self.phase_steps inplace using only torch.where."""
         hover_target = cube_pos.clone()
         hover_target[:, 2] = cube_pos[:, 2] + self.HOVER_HEIGHT
@@ -275,13 +309,18 @@ class GuidedPolicy:
                              (self.phases == self.PHASE_DESCEND)
         proximity_trigger  = in_proximity_phase & (dist < thresh)
 
-        should_advance = budget_exceeded | proximity_trigger
+        # LIFT → HOLD when EE z reaches goal z (vertical-only lift, safe for grip)
+        z_dist_to_goal = torch.abs(ee_pos[:, 2] - goal_pos[:, 2])
+        lift_trigger   = (self.phases == self.PHASE_LIFT) & (z_dist_to_goal < self.LIFT_THRESH)
 
-        next_phase = (self.phases + 1) % 4
+        should_advance = budget_exceeded | proximity_trigger | lift_trigger
+
+        next_phase = (self.phases + 1).clamp_(max=self.PHASE_HOLD)
         self.phases      = torch.where(should_advance, next_phase, self.phases)
         self.phase_steps.mul_((~should_advance).int()).add_(1)
 
-    def _compute_actions(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor):
+    def _compute_actions(self, ee_pos: torch.Tensor, cube_pos: torch.Tensor,
+                         goal_pos: torch.Tensor):
         """Fill self._action_buf inplace with joint delta actions."""
         # --- Target selection ---
         self._target_buf.copy_(cube_pos)
@@ -290,14 +329,17 @@ class GuidedPolicy:
 
         phase_is_0 = (self.phases == self.PHASE_APPROACH).unsqueeze(1)
         phase_is_3 = (self.phases == self.PHASE_LIFT).unsqueeze(1)
+        phase_is_4 = (self.phases == self.PHASE_HOLD).unsqueeze(1)
 
         target_z_012 = torch.where(phase_is_0.squeeze(1), approach_z, descend_z)
         self._target_buf[:, 2] = target_z_012
 
+        # LIFT: straight up to goal z, keep EE xy fixed — safe for grip stability
         lift_target = ee_pos.clone()
-        lift_target[:, 2] = ee_pos[:, 2] + self.LIFT_DELTA
-
+        lift_target[:, 2] = goal_pos[:, 2]
+        # HOLD: target full goal_pos (horizontal slide into place), no noise → goes static
         target = torch.where(phase_is_3, lift_target, self._target_buf)
+        target = torch.where(phase_is_4, goal_pos,    target)
 
         # --- World-frame EE delta, clamped to EE_GAIN ---
         delta = (target - ee_pos).clamp_(-self.EE_GAIN, self.EE_GAIN)  # [N, 3]
@@ -306,9 +348,10 @@ class GuidedPolicy:
         self._action_buf.zero_()
         self._action_buf[:, :3].copy_(delta)
 
-        # --- Gripper: open for phases 0,1; close for phases 2 (GRASP) and 3 (LIFT) ---
+        # --- Gripper: open for phases 0,1; close for phases 2,3,4 ---
         is_closed   = ((self.phases == self.PHASE_GRASP) |
-                       (self.phases == self.PHASE_LIFT)).float()
+                       (self.phases == self.PHASE_LIFT)  |
+                       (self.phases == self.PHASE_HOLD)).float()
         gripper_cmd = self._gripper_open + \
                       (self._gripper_close - self._gripper_open) * is_closed
         self._action_buf[:, self.GRIPPER_DIM].copy_(gripper_cmd)
@@ -331,9 +374,9 @@ class GuidedPolicy:
 
     def __call__(self) -> torch.Tensor:
         with nvtx.range("GuidedPolicy"):
-            ee_pos, cube_pos = self._get_ee_and_cube_pos()
-            self._advance_phases(ee_pos, cube_pos)
-            self._compute_actions(ee_pos, cube_pos)
+            ee_pos, cube_pos, goal_pos = self._get_ee_and_cube_pos()
+            self._advance_phases(ee_pos, cube_pos, goal_pos)
+            self._compute_actions(ee_pos, cube_pos, goal_pos)
             self._inject_noise()
             # Expose state for the data-collection loop to store per step
             self.last_ee_pos   = ee_pos    # [N, 3] absolute EE position
@@ -716,6 +759,7 @@ def run(cfg: IngestConfig):
                 env=collector.env,
                 num_envs=cfg.num_envs,
                 noise_scale=cfg.noise_scale,
+                device="cpu" if cfg.sim_backend == "cpu" else "cuda",
             )
             obs, _ = collector.reset()
 
@@ -899,6 +943,12 @@ def parse_args():
     p.add_argument("--control_mode", type=str, default="pd_ee_delta_pos",
                     choices=["pd_ee_delta_pos"],
                     help="Robot controller: pd_ee_delta_pos (pinocchio required)")
+    p.add_argument("--sim_backend", type=str, default="gpu", choices=["gpu", "cpu"],
+                    help="Physics backend. Use 'cpu' if cuda.dll unavailable (num_envs=1 only).")
+    p.add_argument("--robot_init_qpos_noise", type=float, default=0.02,
+                    help="Std (rad) of joint-angle noise applied to robot at episode start.")
+    p.add_argument("--cube_spawn_half_size", type=float, default=0.10,
+                    help="Half-side (m) of the XY region where cube and goal are spawned.")
     p.add_argument("--verify_only", action="store_true")
     args = p.parse_args()
     cfg = IngestConfig(**{k: v for k, v in vars(args).items()

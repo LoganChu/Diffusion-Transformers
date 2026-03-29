@@ -117,8 +117,9 @@ def worker(
     """CPU-sim process: physics → RGB → encoder → HDF5."""
     print(f"[Worker {worker_id:02d}] started  seed={cfg.seed}", flush=True)
 
-    # pre-allocate frame buffer on CUDA for extract_rgb
-    frame_buf = torch.empty(1, 3, OBS_H, OBS_W, dtype=torch.float16, device="cuda")
+    # pre-allocate frame buffer; CPU sim workers don't use CUDA for physics
+    fb_device = "cpu" if cfg.sim_backend == "cpu" else "cuda"
+    frame_buf = torch.empty(1, 3, OBS_H, OBS_W, dtype=torch.float16, device=fb_device)
 
     from datetime import datetime, timezone
     metadata = {
@@ -136,6 +137,7 @@ def worker(
                 env=collector.env,
                 num_envs=1,
                 noise_scale=cfg.noise_scale,
+                device="cpu" if cfg.sim_backend == "cpu" else "cuda",
             )
             obs, _ = collector.reset()
             writer.ensure_episode(0)
@@ -183,7 +185,7 @@ def worker(
                 )
 
                 if done:
-                    policy.reset_done_envs(torch.tensor([True], device="cuda"))
+                    policy.reset_done_envs(torch.tensor([True], device=fb_device))
                     writer.finalize_episode(
                         env_id=0, task=cfg.task, seed=cfg.seed,
                         completed=bool(terms[0].item()),
@@ -208,13 +210,20 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--num_workers",          type=int,   default=16)
     p.add_argument("--episodes_per_worker",  type=int,   default=1250)
-    p.add_argument("--max_steps",            type=int,   default=200)
+    p.add_argument("--max_steps",            type=int,   default=400)
     p.add_argument("--shard_dir",            type=str,   default="trajectories_shards")
     p.add_argument("--task",                 type=str,   default="PickCube-v1")
     p.add_argument("--cosmos_ckpt",          type=str,
                    default="pretrained_ckpts/Cosmos-Tokenizer-CI16x16")
-    p.add_argument("--noise_scale",          type=float, default=0.05)
+    p.add_argument("--noise_scale",          type=float, default=0.13)
     p.add_argument("--base_seed",            type=int,   default=42)
+    p.add_argument("--sim_backend",          type=str,   default="cpu",
+                   choices=["gpu", "cpu"],
+                   help="Physics backend. Each worker always uses num_envs=1.")
+    p.add_argument("--robot_init_qpos_noise", type=float, default=0.10,
+                   help="Std (rad) of joint-angle noise applied to robot at episode start.")
+    p.add_argument("--cube_spawn_half_size",  type=float, default=0.15,
+                   help="Half-side (m) of the XY region where cube and goal are spawned.")
     return p.parse_args()
 
 
@@ -259,6 +268,9 @@ def main():
             seed=args.base_seed + i,
             async_writer=False,
             noise_scale=args.noise_scale,
+            sim_backend=args.sim_backend,
+            robot_init_qpos_noise=args.robot_init_qpos_noise,
+            cube_spawn_half_size=args.cube_spawn_half_size,
         )
         p = mp.Process(target=worker, args=(i, cfg, frame_queue, result_queues[i]))
         p.start()

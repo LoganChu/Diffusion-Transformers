@@ -16,28 +16,43 @@ import torch
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
 
-# Pull GuidedPolicy from ingest pipeline
+# Pull GuidedPolicy and wrist-fix helper from ingest pipeline
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from data.ingest import GuidedPolicy
+from data.ingest import GuidedPolicy, ManiSkillCollector
 
 VIDEO_DIR = Path("outputs/videos")
 TASK      = "PickCube-v1"
-MAX_STEPS = 300   # slightly over the 4-phase budget (80+120+40+50=290)
+MAX_STEPS = 400   # covers 5-phase budget (80+120+30+100+60=390)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-episodes", type=int, default=3)
-    p.add_argument("--fps",        type=int, default=20)
-    p.add_argument("--seed",       type=int, default=0)
-    p.add_argument("--noise",      type=float, default=0.15,
-                   help="Action noise std (lower = cleaner demo)")
+    p.add_argument("--n-episodes",           type=int,   default=3)
+    p.add_argument("--fps",                  type=int,   default=20)
+    p.add_argument("--seed",                 type=int,   default=0)
+    p.add_argument("--noise",                type=float, default=0.13,
+                   help="Action noise std applied during APPROACH/DESCEND")
+    p.add_argument("--robot_init_qpos_noise", type=float, default=0.10,
+                   help="Std (rad) of shoulder/elbow joint noise (wrist is fixed straight down)")
+    p.add_argument("--cube_spawn_half_size",  type=float, default=0.15,
+                   help="Half-side (m) of XY region where cube and goal spawn")
     return p.parse_args()
+
+
+def fix_wrist(env):
+    """Reset Panda wrist joints to canonical straight-down orientation."""
+    uwenv = env.unwrapped
+    _WRIST = torch.tensor([0.0, np.pi * 3 / 4, np.pi / 4],
+                           dtype=torch.float32, device=uwenv.device)
+    qpos = uwenv.agent.robot.get_qpos().clone()
+    qpos[:, 4:7] = _WRIST
+    uwenv.agent.robot.set_qpos(qpos)
 
 
 def run_episode(env, policy, seed: int, max_steps: int):
     """Roll out one episode. Returns list of [H,W,3] uint8 frames."""
     obs, _ = env.reset(seed=seed)
+    fix_wrist(env)
     policy.phases.zero_()
     policy.phase_steps.zero_()
 
@@ -72,7 +87,9 @@ def main():
         render_backend="cpu",
         control_mode="pd_ee_delta_pos",
         max_episode_steps=MAX_STEPS + 10,
+        robot_init_qpos_noise=args.robot_init_qpos_noise,
     )
+    env.unwrapped.cube_spawn_half_size = args.cube_spawn_half_size
 
     policy = GuidedPolicy(
         env=env,
