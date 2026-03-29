@@ -62,7 +62,7 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     --compile
 ```
 
-`--compile` enables `torch.compile(mode="max-autotune")` for ~20% speedup. Adds ~2–5 min overhead on the first step. Drop the flag if you hit compile errors.
+`--compile` enables `torch.compile(mode="default")` for ~10–15% speedup. Adds ~1–2 min overhead on the first step. `max-autotune` is avoided here because it uses CUDA Graphs, which conflict with the stateful training loop (random `t` sampling, optimizer steps).
 
 ### Tuning Tips
 

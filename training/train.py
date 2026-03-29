@@ -192,8 +192,8 @@ def train(args):
     model = DiTSmall().to(device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     if args.compile:
-        print("Compiling model with torch.compile(mode='max-autotune') ...")
-        model = torch.compile(model, mode="max-autotune")
+        print("Compiling model with torch.compile(mode='default') ...")
+        model = torch.compile(model, mode="default")
         print("Compilation done.")
 
     # ---- Optimizer + Scheduler ----
