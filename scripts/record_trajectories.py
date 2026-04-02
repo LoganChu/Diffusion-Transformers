@@ -30,13 +30,28 @@ def parse_args():
     p.add_argument("--n-episodes",           type=int,   default=3)
     p.add_argument("--fps",                  type=int,   default=20)
     p.add_argument("--seed",                 type=int,   default=0)
-    p.add_argument("--noise",                type=float, default=0.13,
-                   help="Action noise std applied during APPROACH/DESCEND")
+    p.add_argument("--noise",                type=float, default=None,
+                   help="Fixed action noise std. If omitted, noise is sampled per episode "
+                        "from a log-normal distribution.")
+    p.add_argument("--noise-mu-log",         type=float, default=-2.35,
+                   help="Log-space mean for per-episode noise sampling (default: -2.35)")
+    p.add_argument("--noise-sigma-log",      type=float, default=0.75,
+                   help="Log-space std for per-episode noise sampling (default: 0.75)")
+    p.add_argument("--noise-max",            type=float, default=0.22,
+                   help="Upper truncation for per-episode noise sampling (default: 0.22)")
     p.add_argument("--robot_init_qpos_noise", type=float, default=0.10,
                    help="Std (rad) of shoulder/elbow joint noise (wrist is fixed straight down)")
     p.add_argument("--cube_spawn_half_size",  type=float, default=0.15,
                    help="Half-side (m) of XY region where cube and goal spawn")
     return p.parse_args()
+
+
+def sample_noise(rng, mu_log, sigma_log, sigma_max):
+    """Sample one noise value from a truncated log-normal distribution."""
+    while True:
+        s = rng.lognormal(mean=mu_log, sigma=sigma_log)
+        if s <= sigma_max:
+            return float(s)
 
 
 def fix_wrist(env):
@@ -91,12 +106,20 @@ def main():
     )
     env.unwrapped.cube_spawn_half_size = args.cube_spawn_half_size
 
+    rng = np.random.default_rng(args.seed)
+    fixed_noise = args.noise is not None
+
     policy = GuidedPolicy(
         env=env,
         num_envs=1,
-        noise_scale=args.noise,
+        noise_scale=args.noise if fixed_noise else 0.05,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+
+    if fixed_noise:
+        print(f"Noise mode: fixed  sigma={args.noise}")
+    else:
+        print(f"Noise mode: sampled  LogNormal(mu={args.noise_mu_log}, s={args.noise_sigma_log})  max={args.noise_max}")
 
     # Find next free episode index
     existing = sorted(VIDEO_DIR.glob("episode_*.mp4"))
@@ -104,7 +127,14 @@ def main():
 
     for i in range(args.n_episodes):
         seed = args.seed + i
-        print(f"  Episode {i+1}/{args.n_episodes}  seed={seed} …", end=" ", flush=True)
+
+        if fixed_noise:
+            sigma = args.noise
+        else:
+            sigma = sample_noise(rng, args.noise_mu_log, args.noise_sigma_log, args.noise_max)
+            policy.noise_scale = sigma
+
+        print(f"  Episode {i+1}/{args.n_episodes}  seed={seed}  sigma={sigma:.4f} …", end=" ", flush=True)
 
         frames = run_episode(env, policy, seed=seed, max_steps=MAX_STEPS)
 

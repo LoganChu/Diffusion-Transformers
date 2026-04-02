@@ -45,6 +45,13 @@ from data.ingest import (
 _SENTINEL = None   # poison pill: worker sends this when it is done
 
 
+def _sample_noise(rng: np.random.Generator,
+                  sigma_min: float, sigma_max: float) -> float:
+    """Sample uniformly in log-space between sigma_min and sigma_max."""
+    log_sigma = rng.uniform(low=np.log(sigma_min), high=np.log(sigma_max))
+    return float(np.exp(log_sigma))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Encoder server
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +146,16 @@ def worker(
                 noise_scale=cfg.noise_scale,
                 device="cpu" if cfg.sim_backend == "cpu" else "cuda",
             )
+
+            # Per-worker RNG seeded with cfg.seed (unique per worker)
+            rng = np.random.default_rng(cfg.seed)
+            use_sampled_noise = (cfg.noise_sigma_min is not None
+                                 and cfg.noise_sigma_max is not None)
+            current_noise = cfg.noise_scale
+            if use_sampled_noise:
+                current_noise = _sample_noise(rng, cfg.noise_sigma_min, cfg.noise_sigma_max)
+                policy.noise_scale = current_noise
+
             obs, _ = collector.reset()
             writer.ensure_episode(0)
 
@@ -189,6 +206,7 @@ def worker(
                     writer.finalize_episode(
                         env_id=0, task=cfg.task, seed=cfg.seed,
                         completed=bool(terms[0].item()),
+                        noise_scale=current_noise,
                     )
                     completed += 1
                     if completed % 100 == 0:
@@ -196,6 +214,11 @@ def worker(
                               flush=True)
                     writer.ensure_episode(0)
                     obs, _ = collector.reset()
+                    if use_sampled_noise:
+                        current_noise = _sample_noise(
+                            rng, cfg.noise_sigma_min, cfg.noise_sigma_max
+                        )
+                        policy.noise_scale = current_noise
 
     # signal encoder server that this worker is done
     frame_queue.put(_SENTINEL)
@@ -216,6 +239,11 @@ def parse_args():
     p.add_argument("--cosmos_ckpt",          type=str,
                    default="pretrained_ckpts/Cosmos-Tokenizer-CI16x16")
     p.add_argument("--noise_scale",          type=float, default=0.13)
+    p.add_argument("--noise-sigma-min",      type=float, default=None,
+                   help="Lower noise bound from find_noise_cliff.py (95%% success level). "
+                        "Enables per-episode log-uniform sampling.")
+    p.add_argument("--noise-sigma-max",      type=float, default=None,
+                   help="Upper noise bound from find_noise_cliff.py (5%% success level).")
     p.add_argument("--base_seed",            type=int,   default=42)
     p.add_argument("--sim_backend",          type=str,   default="cpu",
                    choices=["gpu", "cpu"],
@@ -237,7 +265,12 @@ def main():
     total = args.num_workers * args.episodes_per_worker
     print(f"Collecting {total} episodes  "
           f"({args.num_workers} workers × {args.episodes_per_worker} each)")
-    print(f"Shards → {shard_dir.resolve()}\n")
+    print(f"Shards → {shard_dir.resolve()}")
+    if args.noise_sigma_min is not None and args.noise_sigma_max is not None:
+        print(f"Noise: log-uniform  [{args.noise_sigma_min:.4f}, {args.noise_sigma_max:.4f}]")
+    else:
+        print(f"Noise: fixed sigma={args.noise_scale}")
+    print()
 
     # verify Cosmos weights before spawning anything
     ensure_cosmos_weights(args.cosmos_ckpt)
@@ -268,6 +301,8 @@ def main():
             seed=args.base_seed + i,
             async_writer=False,
             noise_scale=args.noise_scale,
+            noise_sigma_min=args.noise_sigma_min,
+            noise_sigma_max=args.noise_sigma_max,
             sim_backend=args.sim_backend,
             robot_init_qpos_noise=args.robot_init_qpos_noise,
             cube_spawn_half_size=args.cube_spawn_half_size,

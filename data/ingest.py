@@ -60,6 +60,8 @@ class IngestConfig:
     rdcc_nbytes: int = 64 * 1024 * 1024
     async_writer: bool = True  # use multiprocess HDF5 writer
     noise_scale: float = 0.13
+    noise_sigma_min: Optional[float] = None   # None = use fixed noise_scale
+    noise_sigma_max: Optional[float] = None   # None = use fixed noise_scale
     control_mode: str = "pd_ee_delta_pos"
     sim_backend: str = "gpu"  # "gpu" or "cpu"; cpu requires num_envs=1 per process
     robot_init_qpos_noise: float = 0.10   # std (rad) of shoulder/elbow noise (wrist is fixed)
@@ -493,7 +495,8 @@ class HDF5Writer:
                               bool(terminated[i]), bool(truncated[i]), bool(success[i]),
                               ee_pos[i], cube_pos[i], int(phases[i]))
 
-    def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
+    def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool,
+                         noise_scale: Optional[float] = None):
         buf = self._buffers.pop(env_id, None)
         if buf is None or len(buf["latents"]) == 0:
             return
@@ -531,6 +534,8 @@ class HDF5Writer:
         grp.attrs["task"] = task
         grp.attrs["seed"] = seed
         grp.attrs["timestamp"] = datetime.now(timezone.utc).isoformat()
+        if noise_scale is not None:
+            grp.attrs["noise_scale"] = noise_scale
         self._episode_count += 1
 
     def flush(self):
@@ -569,8 +574,9 @@ def _hdf5_writer_process(path: str, action_dim: int, metadata: dict,
                 writer.append_batch(latents, actions, rewards, terminated, truncated, success,
                                     ee_pos, cube_pos, phases, num_envs)
             elif cmd == "finalize":
-                _, env_id, task, seed, completed = msg
-                writer.finalize_episode(env_id, task, seed, completed)
+                _, env_id, task, seed, completed = msg[:5]
+                noise_scale = msg[5] if len(msg) > 5 else None
+                writer.finalize_episode(env_id, task, seed, completed, noise_scale)
             elif cmd == "ensure":
                 _, env_id = msg
                 writer.ensure_episode(env_id)
@@ -614,8 +620,9 @@ class AsyncHDF5Writer:
         self.queue.put(("append", latents, actions, rewards, terminated, truncated, success,
                         ee_pos, cube_pos, phases, num_envs))
 
-    def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool):
-        self.queue.put(("finalize", env_id, task, seed, completed))
+    def finalize_episode(self, env_id: int, task: str, seed: int, completed: bool,
+                         noise_scale: Optional[float] = None):
+        self.queue.put(("finalize", env_id, task, seed, completed, noise_scale))
 
     def flush(self):
         self.queue.put(("flush",))
