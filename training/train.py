@@ -72,14 +72,22 @@ def sample_heun(
 # ---------------------------------------------------------------------------
 # Cosine schedule with linear warmup
 # ---------------------------------------------------------------------------
-def cosine_warmup_schedule(optimizer, warmup_steps: int, total_steps: int):
-    """Returns a LambdaLR with linear warmup then cosine decay to 0."""
+def cosine_warmup_schedule(
+    optimizer, warmup_steps: int, total_steps: int, eta_min_ratio: float = 0.01
+):
+    """Returns a LambdaLR with linear warmup then cosine decay to eta_min_ratio * peak_lr.
+
+    eta_min_ratio: floor as a fraction of peak LR (default 0.01 = 1%).
+        0.01 means LR decays to lr * 0.01 instead of 0, keeping a small
+        refinement rate alive in the final epochs rather than zeroing out.
+    """
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return eta_min_ratio + (1.0 - eta_min_ratio) * cosine_decay
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -207,7 +215,8 @@ def train(args):
     steps_per_epoch = len(train_loader)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = min(args.warmup_steps, total_steps // 10)
-    scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
+    scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps,
+                                       eta_min_ratio=args.eta_min_ratio)
 
     # ---- Mixed precision scaler (bfloat16 per CLAUDE.md) ----
     # bfloat16 doesn't need GradScaler (no underflow risk), but we use autocast
@@ -219,7 +228,13 @@ def train(args):
     # ---- Resume from checkpoint ----
     start_epoch = 0
     global_step = 0
-    if args.resume and os.path.isfile(args.resume):
+    if args.resume:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(
+                f"--resume checkpoint not found: {args.resume}\n"
+                f"  Hint: Colab local storage is wiped on session reset. "
+                f"Save checkpoints to Drive with --ckpt_dir /content/drive/MyDrive/checkpoints"
+            )
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -411,6 +426,8 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=1000)
+    p.add_argument("--eta_min_ratio", type=float, default=0.01,
+                   help="LR floor as fraction of peak (default 0.01 = 1%% of peak LR).")
     p.add_argument("--seed", type=int, default=42)
     # Logging
     p.add_argument("--log_every", type=int, default=50)

@@ -46,7 +46,7 @@ class TrajectoryDataset(Dataset):
                 # corruption from the CUDA stream race condition (now fixed in ingest.py).
                 latents_all = grp["latents"][:].astype(np.float32)  # [T, 16, 8, 8]
                 finite = np.isfinite(latents_all).all(axis=(1, 2, 3))        # [T] bool
-                in_range = np.abs(latents_all).max(axis=(1, 2, 3)) < 1000    # [T] bool
+                in_range = np.abs(latents_all).max(axis=(1, 2, 3)) < 50      # [T] bool
                 bad = ~(finite & in_range)                                    # [T] bool
 
                 for t in range(start, T):

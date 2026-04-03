@@ -38,7 +38,7 @@ import gymnasium as gym
 from torch.profiler import record_function
 
 from data.replay       import ReplayBuffer
-from inference.planner import cem_plan, cube_height_score_fn
+from inference.planner import cem_plan, cube_height_score_fn, reward_value_score_fn
 from models.dit        import ACTION_DIM, DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W
 from training.loss     import WorldModelLoss
 
@@ -111,6 +111,15 @@ def parse_reward(reward) -> float:
 # Episode collection
 # ---------------------------------------------------------------------------
 
+def _build_score_fn(args):
+    """Return the CEM score function selected by --score_fn."""
+    if args.score_fn == "reward_value":
+        return lambda model, z, t: reward_value_score_fn(
+            model, z, t, horizon=args.horizon, gamma=args.gamma
+        )
+    return cube_height_score_fn
+
+
 def collect_episode(
     env,
     model:   nn.Module,
@@ -118,6 +127,7 @@ def collect_episode(
     replay:  ReplayBuffer,
     args,
     device:  torch.device,
+    score_fn=None,
 ) -> dict:
     """Run one episode with the CEM planner and push transitions to replay.
 
@@ -162,7 +172,7 @@ def collect_episode(
                 model,
                 ctx_input,
                 ctx_act,
-                score_fn      = cube_height_score_fn,
+                score_fn      = score_fn,
                 horizon       = args.horizon,
                 n_candidates  = args.n_candidates,
                 n_elites      = args.n_elites,
@@ -224,6 +234,7 @@ def evaluate(
     encoder,
     args,
     device:  torch.device,
+    score_fn=None,
 ) -> dict:
     """Run args.eval_episodes greedy episodes and return success rate + mean reward."""
     model.eval()
@@ -251,7 +262,7 @@ def evaluate(
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 a_4d = cem_plan(
                     model, ctx_input, ctx_act,
-                    score_fn      = cube_height_score_fn,
+                    score_fn      = score_fn,
                     horizon       = args.horizon,
                     n_candidates  = args.n_candidates,
                     n_elites      = args.n_elites,
@@ -359,13 +370,18 @@ def train_online(args):
     encoder = load_encoder(args.cosmos_ckpt, device)
     env     = make_env()
 
+    # ---- Score function ----
+    score_fn = _build_score_fn(args)
+    print(f"CEM score function: {args.score_fn}")
+
     # ---- Training loop ----
     best_success_rate = 0.0
     global_update     = 0
 
     for episode in range(args.n_episodes):
         # -- Collect --
-        ep_stats = collect_episode(env, model, encoder, replay, args, device)
+        ep_stats = collect_episode(env, model, encoder, replay, args, device,
+                                   score_fn=score_fn)
 
         # -- Update (skip if replay too small) --
         update_stats: dict[str, float] = {}
@@ -417,7 +433,8 @@ def train_online(args):
 
         # -- Evaluate + checkpoint --
         if (episode + 1) % args.eval_every == 0 and len(replay) >= args.min_replay_size:
-            eval_stats = evaluate(env, model, encoder, args, device)
+            eval_stats = evaluate(env, model, encoder, args, device,
+                                  score_fn=score_fn)
             sr = eval_stats["success_rate"]
             print(
                 f"  >> eval  success_rate={sr:.1%}  "
@@ -481,6 +498,10 @@ def parse_args():
     p.add_argument("--n_elites",         type=int,   default=6)
     p.add_argument("--n_cem_iters",      type=int,   default=3)
     p.add_argument("--num_ode_steps",    type=int,   default=4)
+    p.add_argument("--score_fn",         type=str,   default="cube_pos",
+                   choices=["cube_pos", "reward_value"],
+                   help="CEM score function. Switch to reward_value after online "
+                        "heads are trained (eval/success_rate > 0).")
     # Training
     p.add_argument("--updates_per_ep",   type=int,   default=20)
     p.add_argument("--batch_size",       type=int,   default=128)

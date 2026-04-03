@@ -40,7 +40,7 @@ from __future__ import annotations
 import torch
 from torch.profiler import record_function
 
-from models.dit import ACTION_DIM, IN_CHANNELS, LATENT_H, LATENT_W
+from models.dit import ACTION_DIM, IN_CHANNELS, LATENT_H, LATENT_W, NUM_PATCHES
 
 # Default bounds for pd_ee_delta_pos control mode
 _ACTION_LO = torch.tensor([-0.08, -0.08, -0.08, -1.0])
@@ -104,6 +104,29 @@ def cube_height_score_fn(
         dummy  = torch.zeros(N, ACTION_DIM, device=device, dtype=z_batch.dtype)
         _, cube_pos = model(z_batch, t_batch, dummy, return_aux=True)
         return cube_pos[:, 2].float()   # cube z-coordinate [N]
+
+
+def reward_value_score_fn(
+    model,
+    z_batch: torch.Tensor,   # [N, 16, 8, 8]
+    t_batch: torch.Tensor,   # [N] ones
+    horizon: int = 6,
+    gamma: float = 0.99,
+) -> torch.Tensor:
+    """Score candidates using trained RewardHead + ValueHead with return bootstrap.
+
+    Returns [N] float32: r̂ + γ^H * V̂(z)
+
+    Requires model trained via WorldModelLoss (training/train_online.py).
+    Falls back silently to cube_height_score_fn if heads are untrained
+    (zero-init bias means ValueHead outputs ~0, so scoring degrades gracefully).
+    """
+    with record_function("planner.reward_value_score_fn"):
+        N      = z_batch.shape[0]
+        device = z_batch.device
+        dummy  = torch.zeros(N, ACTION_DIM, device=device, dtype=z_batch.dtype)
+        _, r, _, v = model(z_batch, t_batch, dummy, return_heads=True)
+        return (r + gamma ** horizon * v).squeeze(-1).float()   # [N]
 
 
 # ---------------------------------------------------------------------------

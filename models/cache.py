@@ -49,6 +49,34 @@ class KVCache:
         """Return views (not copies) of the full K/V for a layer."""
         return self._k[layer_idx], self._v[layer_idx]
 
+    def slide(self, layer_idx: int, k_new: Tensor, v_new: Tensor) -> None:
+        """Evict the oldest context frame and append a new one. Zero-allocation.
+
+        Shifts the context region left by one frame slot ([1:n_ctx] → [0:n_ctx-1]),
+        then writes k_new/v_new into the last context slot. Keeps the total
+        sequence length fixed so CUDA graph shapes stay static.
+
+        Call this instead of prefill() after the initial warmup when the rolling
+        context window has been fully filled and must evict the oldest frame.
+
+        Args:
+            layer_idx: Which transformer layer's cache to update.
+            k_new: [B, num_heads, n_frame_tokens, head_dim] newest frame K.
+            v_new: [B, num_heads, n_frame_tokens, head_dim] newest frame V.
+        """
+        with record_function("KVCache.slide"):
+            n_frame = k_new.shape[-2]   # tokens per frame (NUM_PATCHES = 16)
+            # Shift context left by one frame: drop slot 0, open slot at end
+            self._k[layer_idx, :, :, :self.n_ctx - n_frame, :].copy_(
+                self._k[layer_idx, :, :, n_frame:self.n_ctx, :]
+            )
+            self._v[layer_idx, :, :, :self.n_ctx - n_frame, :].copy_(
+                self._v[layer_idx, :, :, n_frame:self.n_ctx, :]
+            )
+            # Write newest frame into the last context slot
+            self._k[layer_idx, :, :, self.n_ctx - n_frame:self.n_ctx, :].copy_(k_new)
+            self._v[layer_idx, :, :, self.n_ctx - n_frame:self.n_ctx, :].copy_(v_new)
+
     def reset(self) -> None:
         """Zero buffers for CUDA Graph replay reuse."""
         self._k.zero_()

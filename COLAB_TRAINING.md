@@ -90,7 +90,8 @@ Watch the WandB dashboard for:
     --ctx_frames 4 \
     --resume checkpoints/best.pt \
     --epochs 200 \
-    --wandb_run_name "a100-cfm-7k-resumed"
+    --wandb_run_name "a100-cfm-7k-resumed" \
+    --compile
 ```
 
 ## 7. Download Results
