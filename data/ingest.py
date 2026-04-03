@@ -417,7 +417,10 @@ class CosmosLatentEncoder:
                 (l2,) = self.encoder.encode(bf16_buf[mid:])
                 latents = torch.cat([l1, l2], dim=0)
                 self._halved = True
-        return latents.to(torch.float32)
+            # Convert inside the stream context so the read is guaranteed to happen
+            # after the JIT encoder finishes writing — no cross-stream race condition.
+            latents_f32 = latents.to(torch.float32)
+        return latents_f32
 
     def sync(self):
         """Wait for the encode stream to finish."""

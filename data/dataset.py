@@ -29,7 +29,9 @@ class TrajectoryDataset(Dataset):
         self.ctx_frames = ctx_frames
 
         # Build an index: list of (episode_key, timestep) pairs
-        # We skip the first ctx_frames steps so we always have full context
+        # We skip the first ctx_frames steps so we always have full context.
+        # Bad frames (NaN or abs > 1000) and any sample whose context window
+        # overlaps a bad frame are excluded so corrupted latents never reach training.
         self._index: list[tuple[str, int]] = []
         with h5py.File(hdf5_path, "r") as f:
             for key in sorted(f.keys()):
@@ -38,8 +40,20 @@ class TrajectoryDataset(Dataset):
                 grp = f[key]
                 T = grp["latents"].shape[0]
                 start = max(1, ctx_frames)  # need at least 1 prior frame for action
+
+                # Compute bad[t] = True if frame t has NaN or any abs value > 1000.
+                # Normal Cosmos latents are in ~[-5, 5]; values > 1000 are encoder
+                # corruption from the CUDA stream race condition (now fixed in ingest.py).
+                latents_all = grp["latents"][:].astype(np.float32)  # [T, 16, 8, 8]
+                finite = np.isfinite(latents_all).all(axis=(1, 2, 3))        # [T] bool
+                in_range = np.abs(latents_all).max(axis=(1, 2, 3)) < 1000    # [T] bool
+                bad = ~(finite & in_range)                                    # [T] bool
+
                 for t in range(start, T):
-                    self._index.append((key, t))
+                    # Exclude if target frame OR any context frame is bad.
+                    window_start = t - ctx_frames
+                    if not bad[window_start : t + 1].any():
+                        self._index.append((key, t))
 
         self._file: h5py.File | None = None
 

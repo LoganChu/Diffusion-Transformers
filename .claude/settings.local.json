@@ -17,8 +17,13 @@
       "Bash(find 'C:/Users/s-lch/OneDrive - Duke University/Sophomore 2025-2026/Second Semester/CS 590 Systems of ML/Diffusion-Transformers' -name *.md -type f)",
       "Bash(grep:*)",
       "Bash(tasklist)",
-      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n ml_env python -u scripts/find_noise_cliff.py --episodes 30)"
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n ml_env python -u scripts/find_noise_cliff.py --episodes 30)",
+      "Bash(tasklist /FI \"STATUS eq RUNNING\")",
+      "Bash(taskkill:*)",
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n ml_env python -u scripts/collect_parallel.py --num_workers 1 --episodes_per_worker 2 --noise-sigma-min 0.05 --noise-sigma-max 0.2797 --sim_backend cpu --shard_dir trajectories_shards_test)",
+      "Bash(C:/Users/s-lch/anaconda3/envs/ml_env/python.exe -c ':*)",
+      "Bash(C:/Users/s-lch/anaconda3/envs/ml_env/python.exe:*)"
     ]
   },
-  "outputStyle": "Learning"
+  "outputStyle": "Explanatory"
 }
