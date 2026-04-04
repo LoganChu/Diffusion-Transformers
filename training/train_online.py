@@ -373,7 +373,7 @@ def train_online(args):
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
-        start_episode     = ckpt["episode"] + 1
+        start_episode     = ckpt.get("episode", -1) + 1   # 0 when loading offline ckpt
         best_success_rate = ckpt.get("best_success_rate", 0.0)
         # Load replay buffer if saved alongside the checkpoint, else fall back to HDF5
         replay_path = args.resume + ".replay"
