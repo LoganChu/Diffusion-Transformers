@@ -249,6 +249,46 @@ class ReplayBuffer:
             mc[t]   = running
         return mc
 
+    def save(self, path: str) -> None:
+        """Persist the filled portion of the buffer to disk."""
+        torch.save(
+            {
+                "z":          self.z[:self._size],
+                "z_next":     self.z_next[:self._size],
+                "ctx":        self.ctx[:self._size],
+                "a_cond":     self.a_cond[:self._size],
+                "r":          self.r[:self._size],
+                "mc_return":  self.mc_return[:self._size],
+                "terminated": self.terminated[:self._size],
+                "truncated":  self.truncated[:self._size],
+                "success":    self.success[:self._size],
+                "_head":      self._head,
+                "_size":      self._size,
+            },
+            path,
+        )
+        print(f"[ReplayBuffer] saved {self._size:,} transitions → {path}")
+
+    def load(self, path: str) -> None:
+        """Restore a buffer previously written by save().
+
+        Clamps to the current capacity if the saved buffer is larger.
+        """
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        n = min(state["_size"], self.capacity)
+        self.z[:n].copy_(state["z"][:n])
+        self.z_next[:n].copy_(state["z_next"][:n])
+        self.ctx[:n].copy_(state["ctx"][:n])
+        self.a_cond[:n].copy_(state["a_cond"][:n])
+        self.r[:n].copy_(state["r"][:n])
+        self.mc_return[:n].copy_(state["mc_return"][:n])
+        self.terminated[:n].copy_(state["terminated"][:n])
+        self.truncated[:n].copy_(state["truncated"][:n])
+        self.success[:n].copy_(state["success"][:n])
+        self._head = state["_head"] % self.capacity
+        self._size = n
+        print(f"[ReplayBuffer] loaded {n:,} transitions ← {path}")
+
     def __len__(self) -> int:
         return self._size
 

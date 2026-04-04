@@ -295,17 +295,21 @@ def evaluate(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, scheduler, scaler, episode, path):
+def save_checkpoint(model, optimizer, scheduler, scaler, episode, path,
+                    replay=None, best_success_rate=0.0):
     torch.save(
         {
-            "model":     model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler":    scaler.state_dict(),
-            "episode":   episode,
+            "model":              model.state_dict(),
+            "optimizer":          optimizer.state_dict(),
+            "scheduler":          scheduler.state_dict(),
+            "scaler":             scaler.state_dict(),
+            "episode":            episode,
+            "best_success_rate":  best_success_rate,
         },
         path,
     )
+    if replay is not None:
+        replay.save(path + ".replay")
     print(f"  >> saved {path}")
 
 
@@ -331,11 +335,6 @@ def train_online(args):
     # ---- Model ----
     model = DiTSmall().to(device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
-
-    if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        print(f"Loaded weights from {args.resume}")
 
     # ---- Optimizer / scheduler ----
     optimizer = torch.optim.AdamW(
@@ -363,7 +362,26 @@ def train_online(args):
         action_dim = ACTION_DIM,   # 4: [dx, dy, dz, gripper]
         gamma      = args.gamma,
     )
-    if args.hdf5:
+
+    # ---- Resume or cold start ----
+    start_episode     = 0
+    best_success_rate = 0.0
+    if args.resume and os.path.isfile(args.resume):
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_episode     = ckpt["episode"] + 1
+        best_success_rate = ckpt.get("best_success_rate", 0.0)
+        # Load replay buffer if saved alongside the checkpoint, else fall back to HDF5
+        replay_path = args.resume + ".replay"
+        if os.path.isfile(replay_path):
+            replay.load(replay_path)
+        elif args.hdf5:
+            replay.seed_from_hdf5(args.hdf5)
+        print(f"Resumed from {args.resume} (episode {start_episode})")
+    elif args.hdf5:
         replay.seed_from_hdf5(args.hdf5)
 
     # ---- Encoder + environment ----
@@ -375,10 +393,9 @@ def train_online(args):
     print(f"CEM score function: {args.score_fn}")
 
     # ---- Training loop ----
-    best_success_rate = 0.0
-    global_update     = 0
+    global_update = 0
 
-    for episode in range(args.n_episodes):
+    for episode in range(start_episode, args.n_episodes):
         # -- Collect --
         ep_stats = collect_episode(env, model, encoder, replay, args, device,
                                    score_fn=score_fn)
@@ -453,6 +470,7 @@ def train_online(args):
                 save_checkpoint(
                     model, optimizer, scheduler, scaler, episode,
                     os.path.join(args.ckpt_dir, "online_best.pt"),
+                    replay=replay, best_success_rate=best_success_rate,
                 )
                 print(f"  >> new best success_rate={sr:.1%}")
 
@@ -461,12 +479,14 @@ def train_online(args):
             save_checkpoint(
                 model, optimizer, scheduler, scaler, episode,
                 os.path.join(args.ckpt_dir, f"online_ep{episode+1:05d}.pt"),
+                replay=replay, best_success_rate=best_success_rate,
             )
 
     env.close()
     save_checkpoint(
         model, optimizer, scheduler, scaler, args.n_episodes - 1,
         os.path.join(args.ckpt_dir, "online_final.pt"),
+        replay=replay, best_success_rate=best_success_rate,
     )
     if run is not None:
         run.finish()
