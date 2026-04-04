@@ -251,12 +251,11 @@ def train(args):
             group["lr"] = args.lr
             group["initial_lr"] = args.lr
         remaining_steps = (args.epochs - start_epoch) * steps_per_epoch
-        resume_warmup = min(args.warmup_steps, remaining_steps // 10)
         scheduler = cosine_warmup_schedule(
-            optimizer, resume_warmup, remaining_steps, eta_min_ratio=args.eta_min_ratio
+            optimizer, 0, remaining_steps, eta_min_ratio=args.eta_min_ratio
         )
         print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})"
-              f" — fresh cosine over {remaining_steps} remaining steps, peak lr={args.lr}")
+              f" — fresh cosine over {remaining_steps} remaining steps, peak lr={args.lr}, no warmup")
 
     # ---- Training ----
     model.train()
