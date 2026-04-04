@@ -368,7 +368,8 @@ def train_online(args):
     best_success_rate = 0.0
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+        model.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
