@@ -39,7 +39,7 @@ from torch.profiler import record_function
 
 from data.replay       import ReplayBuffer
 from inference.planner import cem_plan, cube_height_score_fn, reward_value_score_fn
-from models.dit        import ACTION_DIM, DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W
+from models.dit        import ACTION_DIM, DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W, NUM_PATCHES
 from training.loss     import WorldModelLoss
 
 
@@ -360,7 +360,7 @@ def train_online(args):
     replay = ReplayBuffer(
         capacity   = args.replay_capacity,
         n_ctx      = args.n_ctx,
-        action_dim = 7,
+        action_dim = ACTION_DIM,   # 4: [dx, dy, dz, gripper]
         gamma      = args.gamma,
     )
     if args.hdf5:

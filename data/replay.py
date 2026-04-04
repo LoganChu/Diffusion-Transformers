@@ -193,10 +193,20 @@ class ReplayBuffer:
                 ).to(torch.float16)                               # [T, 16, 8, 8]
                 actions = grp["actions"][:]                       # [T, action_dim]
 
-                rewards    = torch.from_numpy(grp["rewards"][:].astype(np.float32))
-                terminated = torch.from_numpy(grp["terminated"][:].astype(bool))
-                truncated  = torch.from_numpy(grp["truncated"][:].astype(bool))
-                success    = torch.from_numpy(grp["success"][:].astype(bool))
+                # Older HDF5 files (pre-ingest.py v2) may lack reward fields.
+                # Fall back to zeros so seeding still populates z/ctx/a_cond.
+                # WorldModelLoss reward/done/value heads will then rely solely
+                # on online env.step() data once collection begins.
+                if "rewards" in grp:
+                    rewards    = torch.from_numpy(grp["rewards"][:].astype(np.float32))
+                    terminated = torch.from_numpy(grp["terminated"][:].astype(bool))
+                    truncated  = torch.from_numpy(grp["truncated"][:].astype(bool))
+                    success    = torch.from_numpy(grp["success"][:].astype(bool))
+                else:
+                    rewards    = torch.zeros(T, dtype=torch.float32)
+                    terminated = torch.zeros(T, dtype=torch.bool)
+                    truncated  = torch.zeros(T, dtype=torch.bool)
+                    success    = torch.zeros(T, dtype=torch.bool)
 
                 # 4D conditioning: [dx, dy, dz, gripper]
                 cnd = actions[:, :4].astype(np.float32)          # [T, 4]

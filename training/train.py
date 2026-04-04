@@ -238,12 +238,25 @@ def train(args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
         if not use_bf16 and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
-        print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+
+        # Recreate the scheduler fresh for the remaining epochs so that:
+        # 1. --lr is actually the peak LR (not overwritten by checkpoint's base_lrs)
+        # 2. The cosine decays over the remaining epochs, not the full --epochs count
+        # optimizer.load_state_dict restores the old LR into param groups, so reset it.
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+            group["initial_lr"] = args.lr
+        remaining_steps = (args.epochs - start_epoch) * steps_per_epoch
+        resume_warmup = min(args.warmup_steps, remaining_steps // 10)
+        scheduler = cosine_warmup_schedule(
+            optimizer, resume_warmup, remaining_steps, eta_min_ratio=args.eta_min_ratio
+        )
+        print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})"
+              f" — fresh cosine over {remaining_steps} remaining steps, peak lr={args.lr}")
 
     # ---- Training ----
     model.train()
