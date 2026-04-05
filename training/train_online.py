@@ -80,7 +80,7 @@ def encode_frame(encoder, frame_hwc: np.ndarray | torch.Tensor) -> torch.Tensor:
 # Environment helpers
 # ---------------------------------------------------------------------------
 
-def make_env(control_mode: str = "pd_ee_delta_pos") -> gym.Env:
+def make_env(control_mode: str = "pd_ee_delta_pos", max_episode_steps: int = 200) -> gym.Env:
     return gym.make(
         "PickCube-v1",
         num_envs=1,
@@ -88,6 +88,7 @@ def make_env(control_mode: str = "pd_ee_delta_pos") -> gym.Env:
         render_mode="rgb_array",
         render_backend="cpu",
         control_mode=control_mode,
+        max_episode_steps=max_episode_steps,
     )
 
 
@@ -370,9 +371,13 @@ def train_online(args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
         model.load_state_dict(state_dict)
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        scaler.load_state_dict(ckpt["scaler"])
+        is_online_ckpt = "episode" in ckpt   # False for offline checkpoints
+        if is_online_ckpt:
+            # Full resume: restore optimizer, scheduler, scaler from a previous online run
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            scaler.load_state_dict(ckpt["scaler"])
+        # For offline warm-starts, keep fresh optimizer + scheduler (lr starts at args.lr)
         start_episode     = ckpt.get("episode", -1) + 1   # 0 when loading offline ckpt
         best_success_rate = ckpt.get("best_success_rate", 0.0)
         # Load replay buffer if saved alongside the checkpoint, else fall back to HDF5
@@ -387,7 +392,7 @@ def train_online(args):
 
     # ---- Encoder + environment ----
     encoder = load_encoder(args.cosmos_ckpt, device)
-    env     = make_env()
+    env     = make_env(max_episode_steps=args.max_steps)
 
     # ---- Score function ----
     score_fn = _build_score_fn(args)

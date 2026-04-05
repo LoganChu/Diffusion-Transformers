@@ -187,10 +187,18 @@ class ReplayBuffer:
                 if "latents" not in grp or "actions" not in grp:
                     continue
 
-                T       = grp["latents"].shape[0]
-                latents = torch.from_numpy(
-                    grp["latents"][:].astype(np.float32)
-                ).to(torch.float16)                               # [T, 16, 8, 8]
+                T           = grp["latents"].shape[0]
+                latents_np  = grp["latents"][:].astype(np.float32)  # [T, 16, 8, 8]
+
+                # Skip episodes containing corrupted Cosmos encoder frames
+                # (same threshold as dataset.py: abs > 50 or non-finite).
+                # Corrupted frames produce NaN loss in WorldModelLoss.
+                finite   = np.isfinite(latents_np).all(axis=(1, 2, 3))
+                in_range = np.abs(latents_np).max(axis=(1, 2, 3)) < 50
+                if not (finite & in_range).all():
+                    continue
+
+                latents = torch.from_numpy(latents_np).to(torch.float16)
                 actions = grp["actions"][:]                       # [T, action_dim]
 
                 # Older HDF5 files (pre-ingest.py v2) may lack reward fields.
