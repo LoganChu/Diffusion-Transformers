@@ -70,7 +70,7 @@ def encode_frame(encoder, frame_hwc: np.ndarray | torch.Tensor) -> torch.Tensor:
         frame = F.interpolate(
             frame.unsqueeze(0), size=(128, 128), mode="bilinear", align_corners=False
         ).squeeze(0)
-    buf = frame.unsqueeze(0).to(torch.float16)         # [1, 3, 128, 128]
+    buf = frame.unsqueeze(0).to("cuda", dtype=torch.float16)  # [1, 3, 128, 128]
     latent = encoder.encode(buf)                        # [1, 16, 8, 8]
     encoder.sync()
     return latent.to(torch.float16)

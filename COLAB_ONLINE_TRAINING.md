@@ -30,10 +30,13 @@ with learned task signals instead of the proxy cube-height scorer.
 
 # Install core dependencies
 !pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-!pip install h5py wandb imageio numpy
+!pip install h5py wandb imageio numpy huggingface_hub
 
 # Install ManiSkill 3 (required for online env interaction)
 !pip install mani-skill
+
+# Install Cosmos Tokenizer (required for encoding RGB frames to latents)
+!pip install git+https://github.com/NVIDIA/Cosmos-Tokenizer.git
 
 # Login to WandB
 import wandb
