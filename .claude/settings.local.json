@@ -22,7 +22,15 @@
       "Bash(taskkill:*)",
       "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n ml_env python -u scripts/collect_parallel.py --num_workers 1 --episodes_per_worker 2 --noise-sigma-min 0.05 --noise-sigma-max 0.2797 --sim_backend cpu --shard_dir trajectories_shards_test)",
       "Bash(C:/Users/s-lch/anaconda3/envs/ml_env/python.exe -c ':*)",
-      "Bash(C:/Users/s-lch/anaconda3/envs/ml_env/python.exe:*)"
+      "Bash(C:/Users/s-lch/anaconda3/envs/ml_env/python.exe:*)",
+      "Bash(ls -lh *.pt)",
+      "Bash(python -c \"import torch; ck=torch.load\\('online_best.pt', map_location='cpu', weights_only=False\\); print\\('online_best.pt keys:', list\\(ck.keys\\(\\)\\)\\)\")",
+      "Bash(conda list:*)",
+      "Bash(conda info:*)",
+      "Bash(ls -la \"C:/Users/s-lch/OneDrive - Duke University/Sophomore 2025-2026/Second Semester/CS 590 Systems of ML/Diffusion-Transformers\"/*.pt)",
+      "Bash(kill 2656)",
+      "Bash(pkill -f \"train_online\")",
+      "Bash(echo \"PID: $!\")"
     ]
   },
   "outputStyle": "Explanatory"

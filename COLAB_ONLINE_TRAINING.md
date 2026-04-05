@@ -25,7 +25,7 @@ with learned task signals instead of the proxy cube-height scorer.
 
 ```python
 # Clone repo (or upload zip)
-!git clone https://github.com/<your-username>/Diffusion-Transformers.git
+!git clone https://github.com/LoganChu/Diffusion-Transformers.git
 %cd Diffusion-Transformers
 
 # Install core dependencies
@@ -158,6 +158,7 @@ offline baseline, the world model dynamics are being overwritten. Lower `--lr`
 | `--expl_noise` | 0.02 | Gaussian noise added to planned actions for exploration |
 | `--eval_every` | 20 | Evaluate greedy policy every N episodes |
 | `--eval_episodes` | 10 | Episodes used per evaluation |
+| `--save_every` | 10 | Periodic checkpoint interval (~1 hr at 6 min/episode) |
 
 ---
 

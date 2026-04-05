@@ -90,6 +90,7 @@ def cube_height_score_fn(
     model,
     z_batch: torch.Tensor,   # [N, 16, 8, 8]  predicted next latent
     t_batch: torch.Tensor,   # [N]  ones — treat z as a clean latent
+    **kwargs,
 ) -> torch.Tensor:
     """Score candidates by the predicted cube z-coordinate.
 
@@ -112,6 +113,7 @@ def reward_value_score_fn(
     t_batch: torch.Tensor,   # [N] ones
     horizon: int = 6,
     gamma: float = 0.99,
+    **kwargs,
 ) -> torch.Tensor:
     """Score candidates using trained RewardHead + ValueHead with return bootstrap.
 
@@ -127,6 +129,66 @@ def reward_value_score_fn(
         dummy  = torch.zeros(N, ACTION_DIM, device=device, dtype=z_batch.dtype)
         _, r, _, v = model(z_batch, t_batch, dummy, return_heads=True)
         return (r + gamma ** horizon * v).squeeze(-1).float()   # [N]
+
+
+def reward_only_score_fn(
+    model,
+    z_batch: torch.Tensor,   # [N, 16, 8, 8]
+    t_batch: torch.Tensor,   # [N] ones
+    **kwargs,
+) -> torch.Tensor:
+    """Score candidates using only the RewardHead — no value bootstrapping.
+
+    Use this when the ValueHead is unreliable (e.g., after offline-only head
+    pretraining where offline MC returns dominate and value overestimates).
+    The RewardHead converges faster (pure MSE on per-step rewards) and gives
+    clean directional signal without the instability of value bootstrapping.
+
+    Returns [N] float32: r̂(z)
+    """
+    with record_function("planner.reward_only_score_fn"):
+        N      = z_batch.shape[0]
+        device = z_batch.device
+        dummy  = torch.zeros(N, ACTION_DIM, device=device, dtype=z_batch.dtype)
+        _, r, _, _ = model(z_batch, t_batch, dummy, return_heads=True)
+        return r.squeeze(-1).float()   # [N]
+
+
+def maniskill_reward_score_fn(
+    model,
+    z_batch: torch.Tensor,              # [N, 16, 8, 8]
+    t_batch: torch.Tensor,              # [N] ones
+    cumulative_ee: torch.Tensor | None = None,   # [N, 3] world-frame ee pos after cumulative actions
+    **kwargs,
+) -> torch.Tensor:
+    """Score using the ManiSkill PickCube reward formula on imagined latents.
+
+    score = reach_reward + lift_reward
+          = −||ee_pos_predicted − cube_pos_predicted||  +  cube_z / 0.15
+
+    cube_pos is extracted from the imagined latent via CubePosHead (trained offline,
+    world-frame XYZ, ~0.04m XY error). ee_pos is approximated as the starting
+    ee_pos plus the cumulative CEM action displacements — valid because pd_ee_delta_pos
+    actions are world-frame deltas in the same coordinate frame as cube_pos.
+
+    Falls back to cube_height if no ee_pos is provided (cumulative_ee=None).
+
+    Requires: cem_plan called with ee_pos=[3] from env.unwrapped.agent.tcp.pose.p.
+    """
+    with record_function("planner.maniskill_reward_score_fn"):
+        N      = z_batch.shape[0]
+        device = z_batch.device
+        dummy  = torch.zeros(N, ACTION_DIM, device=device, dtype=z_batch.dtype)
+        _, cube_pos = model(z_batch, t_batch, dummy, return_aux=True)   # [N, 3]
+
+        lift = cube_pos[:, 2].float() / 0.15   # [N]
+
+        if cumulative_ee is not None:
+            ee    = cumulative_ee.to(device=device, dtype=torch.float32)   # [N, 3]
+            reach = -(ee - cube_pos.float()).norm(dim=-1)                  # [N]
+            return reach + lift
+        else:
+            return lift   # graceful fallback — same as cube_height but normalised
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +210,8 @@ def cem_plan(
     action_lo: torch.Tensor | None = None,
     action_hi: torch.Tensor | None = None,
     noise_std_init: float = 0.05,
+    log_score_stats: bool = False,
+    ee_pos: torch.Tensor | None = None,   # [3] world-frame ee pos from env (for maniskill_reward)
 ) -> torch.Tensor:
     """CEM-MPC: plan one control action via cross-entropy optimisation.
 
@@ -155,7 +219,7 @@ def cem_plan(
         model:          DiTSmall in eval mode (float16 on CUDA).
         ctx_latents:    [1, n_ctx, 16, 8, 8] recent encoded observation frames.
         ctx_actions:    [1, 4] most recent action conditioning vector.
-        score_fn:       Callable(model, z [N,C,H,W], t [N]) -> [N] float32.
+        score_fn:       Callable(model, z [N,C,H,W], t [N], **kwargs) -> [N] float32.
                         Defaults to cube_height_score_fn.
         horizon:        Planning horizon in world-model steps.
         n_candidates:   Number of parallel candidate sequences (N).
@@ -165,6 +229,8 @@ def cem_plan(
         num_ode_steps:  Euler steps per latent transition (4 is a good tradeoff).
         action_lo/hi:   [4] action bounds. Default: pd_ee_delta_pos bounds ±0.08m.
         noise_std_init: Initial std of the CEM action distribution.
+        ee_pos:         [3] world-frame end-effector position from env observation.
+                        Required for maniskill_reward_score_fn; ignored by others.
 
     Returns:
         [4] tensor — first action of the best planned sequence [dx, dy, dz, gripper].
@@ -199,15 +265,26 @@ def cem_plan(
                 ctx_roll = ctx_base.clone()
                 returns  = torch.zeros(N, device=device, dtype=torch.float32)
 
+                # Track cumulative ee displacement for maniskill_reward_score_fn.
+                # ee_pos_init [3] → cumulative_ee [N, 3] grows by action_xyz each step.
+                cumulative_ee: torch.Tensor | None = None
+                if ee_pos is not None:
+                    cumulative_ee = ee_pos.float().to(device).unsqueeze(0).expand(N, -1).clone()
+
                 for h in range(H):
                     with record_function(f"cem_horizon_{h}"):
                         a_cond = actions[:, h, :]   # [N, 4]
+
+                        if cumulative_ee is not None:
+                            cumulative_ee = cumulative_ee + a_cond[:, :3].float()
 
                         z_next = _euler_rollout_step(
                             model, ctx_roll, a_cond, num_ode_steps, dtype
                         )   # [N, 16, 8, 8]
 
-                        step_score = score_fn(model, z_next, t_ones)   # [N] float32
+                        step_score = score_fn(
+                            model, z_next, t_ones, cumulative_ee=cumulative_ee
+                        )   # [N] float32
                         returns.add_(step_score * float(gamma ** h))
 
                         # Advance rolling context window
@@ -218,6 +295,15 @@ def cem_plan(
                 # --- Refit to top-K elites ---
                 _, elite_idx  = returns.topk(n_elites)
                 elite_actions = actions[elite_idx].float()   # [n_elites, H, 4]
+
+                if log_score_stats:
+                    print(
+                        f"  [cem iter {cem_iter}] "
+                        f"score min={returns.min():.4f}  "
+                        f"max={returns.max():.4f}  "
+                        f"std={returns.std():.4f}  "
+                        f"elite_mean_action={elite_actions[:, 0].mean(0).tolist()}"
+                    )
 
                 mean = elite_actions.mean(dim=0).to(dtype)
                 std  = elite_actions.std(dim=0).clamp(min=0.01).to(dtype)
