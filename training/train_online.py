@@ -511,21 +511,15 @@ def train_online(args):
         start_episode     = ckpt.get("episode", -1) + 1   # 0 when loading offline ckpt
         best_success_rate = ckpt.get("best_success_rate", 0.0)
         # Load replay buffer: for online resumes use the saved replay so online
-        # experience is preserved.  For offline warm-starts always seed from HDF5
-        # so pretrain_heads sees offline success data, not a stale online replay.
+        # experience is preserved.  For offline warm-starts seed from HDF5.
         replay_path = args.resume + ".replay"
         if is_online_ckpt and os.path.isfile(replay_path):
             replay.load(replay_path)
         elif args.hdf5:
             replay.seed_from_hdf5(args.hdf5)
         print(f"Resumed from {args.resume} (episode {start_episode})")
-        # Pre-train task heads on offline data only when warm-starting from an
-        # offline checkpoint.  Online checkpoints already have trained heads.
-        if not is_online_ckpt:
-            pretrain_heads(model, replay, args, device, amp_dtype)
     elif args.hdf5:
         replay.seed_from_hdf5(args.hdf5)
-        pretrain_heads(model, replay, args, device, amp_dtype)
 
     # ---- Encoder + environment ----
     encoder = load_encoder(args.cosmos_ckpt, device)
@@ -679,10 +673,6 @@ def parse_args():
                         "reward_value: RewardHead+ValueHead bootstrap (best after online training). "
                         "reward_only: RewardHead only (avoids value overestimation).")
     # Training
-    p.add_argument("--pretrain_heads_steps", type=int, default=2000,
-                   help="Gradient steps to pre-train reward/done/value heads on "
-                        "offline HDF5 data before online collection begins. "
-                        "Backbone is frozen during this phase. Set 0 to skip.")
     p.add_argument("--updates_per_ep",   type=int,   default=20)
     p.add_argument("--batch_size",       type=int,   default=128)
     p.add_argument("--lr",               type=float, default=3e-4)
