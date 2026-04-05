@@ -110,8 +110,8 @@ def test_score_discriminability(model, ctx_input, device, args, label: str):
 
     captured = {}
 
-    def capturing_score(model_, z, t):
-        scores = orig_score(model_, z, t)
+    def capturing_score(model_, z, t, **kwargs):
+        scores = orig_score(model_, z, t, **kwargs)
         captured.setdefault("all_scores", []).append(scores.detach().cpu())
         return scores
 
@@ -505,7 +505,7 @@ def run(args):
     print("         (reward head was trained on dense env reward incl. reach distance)")
     print(SEPARATOR)
 
-    def _rv_score(model_, z, t):
+    def _rv_score(model_, z, t, **kwargs):
         return reward_value_score_fn(model_, z, t, horizon=args.horizon)
 
     # Patch score_fn to use reward_value and run for online model only
