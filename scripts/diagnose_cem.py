@@ -35,7 +35,8 @@ import gymnasium as gym
 
 from data.ingest       import ensure_cosmos_weights, CosmosLatentEncoder
 from inference.planner import (
-    cem_plan, cube_height_score_fn, reward_only_score_fn, reward_value_score_fn,
+    cem_plan, cube_height_score_fn, maniskill_reward_score_fn,
+    reward_only_score_fn, reward_value_score_fn,
     _euler_rollout_step, _ACTION_LO, _ACTION_HI,
 )
 from models.dit        import ACTION_DIM, DiTSmall, IN_CHANNELS, LATENT_H, LATENT_W
@@ -305,24 +306,47 @@ def test_reward_head_directionality(model, encoder, env, device, args, label: st
         [ 0.0,  -delta,  0.0, 0.0],   # -y
     ], device=device, dtype=dtype)    # [4, 4]
 
-    # --- Score with reward_value and reward_only ---
+    # --- Get ee_pos from env for maniskill_reward ---
+    try:
+        ee_pos = env.unwrapped.agent.tcp.pose.p[0].to(device).float()   # [3]
+    except Exception:
+        ee_pos = None
+
+    # --- Score with reward_value, reward_only, and maniskill_reward ---
     with torch.amp.autocast("cuda", dtype=torch.float16):
         z_nexts   = _euler_rollout_step(model, ctx_exp, cardinal_actions, args.n_ode, dtype)
         t_ones    = torch.ones(4, device=device, dtype=dtype)
         rv_scores = reward_value_score_fn(model, z_nexts, t_ones).cpu()
         ro_scores = reward_only_score_fn(model, z_nexts, t_ones).cpu()
 
+        if ee_pos is not None:
+            # cumulative_ee = ee_pos + action_xyz for 1-step rollout
+            cum_ee    = ee_pos.unsqueeze(0) + cardinal_actions[:, :3].float()   # [4, 3]
+            ms_scores = maniskill_reward_score_fn(
+                model, z_nexts, t_ones, cumulative_ee=cum_ee
+            ).cpu()
+        else:
+            ms_scores = None
+
     names = ["+x", "-x", "+y", "-y"]
     print(f"  reward_value scores for cardinal actions (same starting state):")
-    for i, (name, score) in enumerate(zip(names, rv_scores.tolist())):
+    for name, score in zip(names, rv_scores.tolist()):
         print(f"    action {name}: score={score:.4f}")
-    print(f"  reward_value  range: {rv_scores.max()-rv_scores.min():.4f}  "
+    print(f"  reward_value   range: {rv_scores.max()-rv_scores.min():.4f}  "
           f"std: {rv_scores.std():.4f}")
-    print(f"  reward_only scores for cardinal actions (reward head only, no value):")
-    for i, (name, score) in enumerate(zip(names, ro_scores.tolist())):
+
+    print(f"  reward_only scores:")
+    for name, score in zip(names, ro_scores.tolist()):
         print(f"    action {name}: score={score:.4f}")
-    print(f"  reward_only   range: {ro_scores.max()-ro_scores.min():.4f}  "
+    print(f"  reward_only    range: {ro_scores.max()-ro_scores.min():.4f}  "
           f"std: {ro_scores.std():.4f}")
+
+    if ms_scores is not None:
+        print(f"  maniskill_reward scores (reach+lift, ee_pos from env):")
+        for name, score in zip(names, ms_scores.tolist()):
+            print(f"    action {name}: score={score:.4f}")
+        print(f"  maniskill_reward range: {ms_scores.max()-ms_scores.min():.4f}  "
+              f"std: {ms_scores.std():.4f}")
 
     # --- Compare against actual env rewards for same actions ---
     print(f"\n  actual env rewards for same actions (ground truth):")
@@ -341,21 +365,24 @@ def test_reward_head_directionality(model, encoder, env, device, args, label: st
     env_rewards_t = torch.tensor(env_rewards)
     env_rank = env_rewards_t.argsort().argsort().float()
 
-    # Rank correlation for reward_value
-    rv_rank      = rv_scores.argsort().argsort().float()
-    rv_rank_corr = torch.corrcoef(torch.stack([rv_rank, env_rank]))[0, 1].item()
+    def _rank_corr(scores):
+        r = scores.argsort().argsort().float()
+        return torch.corrcoef(torch.stack([r, env_rank]))[0, 1].item()
 
-    # Rank correlation for reward_only
-    ro_rank      = ro_scores.argsort().argsort().float()
-    ro_rank_corr = torch.corrcoef(torch.stack([ro_rank, env_rank]))[0, 1].item()
+    rv_rank_corr = _rank_corr(rv_scores)
+    ro_rank_corr = _rank_corr(ro_scores)
+    ms_rank_corr = _rank_corr(ms_scores) if ms_scores is not None else float("nan")
 
-    print(f"\n  Best reward_value action: {names[rv_scores.argmax()]}  "
-          f"Best reward_only action: {names[ro_scores.argmax()]}  "
-          f"Best actual action: {names[env_rewards_t.argmax()]}")
-    print(f"  Rank corr — reward_value: {rv_rank_corr:.3f}  "
-          f"reward_only: {ro_rank_corr:.3f}  "
-          f"(+1=perfect, 0=random, -1=inverted)")
-    return rv_rank_corr, ro_rank_corr
+    print(f"\n  Best actual action:       {names[env_rewards_t.argmax()]}")
+    print(f"  Best reward_value action: {names[rv_scores.argmax()]}  "
+          f"rank_corr={rv_rank_corr:.3f}")
+    print(f"  Best reward_only action:  {names[ro_scores.argmax()]}  "
+          f"rank_corr={ro_rank_corr:.3f}")
+    if ms_scores is not None:
+        print(f"  Best maniskill_reward action: {names[ms_scores.argmax()]}  "
+              f"rank_corr={ms_rank_corr:.3f}")
+    print(f"  (+1=perfect, 0=random, -1=inverted)")
+    return rv_rank_corr, ro_rank_corr, ms_rank_corr
 
 
 def print_verdict(pretrained_stats: dict, online_stats: dict):
@@ -377,10 +404,15 @@ def print_verdict(pretrained_stats: dict, online_stats: dict):
     if "rank_corr" in online_stats:
         rv_rc = online_stats["rank_corr"]
         ro_rc = online_stats.get("rank_corr_ro", float("nan"))
-        print(f"  {'Rank corr reward_value':<35s}  {rv_rc:.3f}  "
-              f"({'GOOD ✓' if rv_rc > 0.5 else 'INVERTED ✗' if rv_rc < -0.3 else 'WEAK'})")
-        print(f"  {'Rank corr reward_only':<35s}  {ro_rc:.3f}  "
-              f"({'GOOD ✓' if ro_rc > 0.5 else 'INVERTED ✗' if ro_rc < -0.3 else 'WEAK'})")
+        ms_rc = online_stats.get("rank_corr_ms", float("nan"))
+
+        def _label(v):
+            if v != v: return "N/A"
+            return "GOOD ✓" if v > 0.5 else "INVERTED ✗" if v < -0.3 else "WEAK"
+
+        print(f"  {'Rank corr reward_value':<35s}  {rv_rc:.3f}  ({_label(rv_rc)})")
+        print(f"  {'Rank corr reward_only':<35s}  {ro_rc:.3f}  ({_label(ro_rc)})")
+        print(f"  {'Rank corr maniskill_reward':<35s}  {ms_rc:.3f}  ({_label(ms_rc)})")
 
     print(SEPARATOR)
     print("VERDICT:")
@@ -389,10 +421,12 @@ def print_verdict(pretrained_stats: dict, online_stats: dict):
     latent_ok       = online_stats["cos_sim"]     > 0.5
     action_stable   = online_stats["action_std"]  < 0.03
     arm_moves       = online_stats["action_mag"]  > 0.005
-    rv_rc           = online_stats.get("rank_corr", 0.0)
-    ro_rc           = online_stats.get("rank_corr_ro", 0.0)
-    reward_value_ok = rv_rc > 0.3
-    reward_only_ok  = ro_rc > 0.3
+    rv_rc             = online_stats.get("rank_corr", 0.0)
+    ro_rc             = online_stats.get("rank_corr_ro", 0.0)
+    ms_rc             = online_stats.get("rank_corr_ms", 0.0)
+    reward_value_ok   = rv_rc > 0.3
+    reward_only_ok    = ro_rc > 0.3
+    maniskill_ok      = ms_rc > 0.3
 
     if score_improved and latent_ok and action_stable and arm_moves:
         print("  PASS — online model is more discriminating, world model predictions")
@@ -409,13 +443,19 @@ def print_verdict(pretrained_stats: dict, online_stats: dict):
             issues.append("actions inconsistent across runs — score function is noisy")
         if not arm_moves:
             issues.append("action magnitude ≈ 0 — planner prefers no-movement")
-        if "rank_corr" in online_stats and not reward_value_ok and not reward_only_ok:
-            issues.append(f"reward_value rank_corr={rv_rc:.3f}, reward_only rank_corr={ro_rc:.3f} "
-                          "— both score fns unreliable; fall back to cube_pos")
-        elif "rank_corr" in online_stats and not reward_value_ok and reward_only_ok:
-            issues.append(f"reward_value rank_corr={rv_rc:.3f} inverted (value overestimation) "
-                          f"but reward_only rank_corr={ro_rc:.3f} is good — "
-                          "use --score_fn reward_only")
+        if "rank_corr" in online_stats:
+            if maniskill_ok:
+                pass   # maniskill_reward is reliable — good to train with
+            elif not reward_value_ok and not reward_only_ok and not maniskill_ok:
+                issues.append(
+                    f"all score fns unreliable (rv={rv_rc:.3f} ro={ro_rc:.3f} ms={ms_rc:.3f})"
+                    " — check CubePosHead calibration (Test 2)"
+                )
+            elif not reward_value_ok and reward_only_ok:
+                issues.append(
+                    f"reward_value rank_corr={rv_rc:.3f} inverted (value overestimation) "
+                    f"but reward_only={ro_rc:.3f} ok — use --score_fn reward_only"
+                )
         print("  ISSUES FOUND:")
         for issue in issues:
             print(f"    - {issue}")
@@ -504,11 +544,12 @@ def run(args):
     print("TEST 5: Reward Head Directionality (online model only)")
     print("        Does it prefer toward-cube actions over away-from-cube?")
     print(SEPARATOR)
-    rv_rc, ro_rc = test_reward_head_directionality(
+    rv_rc, ro_rc, ms_rc = test_reward_head_directionality(
         onl_model, encoder, env, device, args, "online"
     )
     onl_stats["rank_corr"]          = rv_rc
     onl_stats["rank_corr_ro"]       = ro_rc
+    onl_stats["rank_corr_ms"]       = ms_rc
 
     env.close()
 
