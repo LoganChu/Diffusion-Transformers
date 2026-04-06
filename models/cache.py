@@ -46,8 +46,9 @@ class KVCache:
             self._v[layer_idx, :, :, self.n_ctx :, :].copy_(v_den)
 
     def get_kv(self, layer_idx: int) -> tuple[Tensor, Tensor]:
-        """Return views (not copies) of the full K/V for a layer."""
-        return self._k[layer_idx], self._v[layer_idx]
+        """Return views of the context K/V for a layer (BS=1, context tokens only)."""
+        return (self._k[layer_idx, :, :, :self.n_ctx, :],
+                self._v[layer_idx, :, :, :self.n_ctx, :])
 
     def slide(self, layer_idx: int, k_new: Tensor, v_new: Tensor) -> None:
         """Evict the oldest context frame and append a new one. Zero-allocation.
@@ -139,12 +140,13 @@ class RingKVCache:
             self._v[layer_idx, :, :, self.n_ctx:, :].copy_(v_den)
 
     def get_kv(self, layer_idx: int) -> tuple[Tensor, Tensor]:
-        """Return views (not copies) of the full K/V for a layer.
+        """Return views of the context K/V for a layer (BS=1, context tokens only).
 
         Context tokens are in ring-buffer physical order, not logical
         chronological order. This is correct for full (non-causal) attention.
         """
-        return self._k[layer_idx], self._v[layer_idx]
+        return (self._k[layer_idx, :, :, :self.n_ctx, :],
+                self._v[layer_idx, :, :, :self.n_ctx, :])
 
     def slide_ring(self, layer_idx: int, k_new: Tensor, v_new: Tensor) -> None:
         """Write new frame K/V at the current head slot, evicting the oldest frame.

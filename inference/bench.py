@@ -42,8 +42,8 @@ def _make_cache(n_ctx_tokens: int, device, dtype):
 
 
 @torch.no_grad()
-def bench_heun_cached(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
-    """Heun with persistent cache (prefill once)."""
+def bench_euler_cached_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
+    """Euler (BS=1) with persistent cache (prefill once)."""
     B = 1
     device = action.device
     dtype = next(model.parameters()).dtype
@@ -56,19 +56,10 @@ def bench_heun_cached(model, ctx_latents, ctx_actions, action, num_steps, warmup
             cache = _make_cache(n_ctx_tokens, device, dtype)
             model.prefill_cache(ctx_latents, ctx_actions, cache)
             x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-            x_euler = torch.empty_like(x)
-
             for i in range(num_steps):
                 t_buf.fill_(i * dt)
-                v1 = model(x, t_buf, action, cache=cache)
-                if i < num_steps - 1:
-                    torch.add(x, v1, alpha=dt, out=x_euler)
-                    t_buf.fill_((i + 1) * dt)
-                    v2 = model(x_euler, t_buf, action, cache=cache)
-                    v1.add_(v2)
-                    x.add_(v1, alpha=dt * 0.5)
-                else:
-                    x.add_(v1, alpha=dt)
+                v = model(x, t_buf, action, cache=cache)
+                x.add_(v, alpha=dt)
             return x
 
     # Warmup
@@ -92,8 +83,8 @@ def bench_heun_cached(model, ctx_latents, ctx_actions, action, num_steps, warmup
 
 
 @torch.no_grad()
-def bench_heun_recompute(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
-    """Heun with fresh cache per model evaluation (recompute baseline)."""
+def bench_euler_recompute_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
+    """Euler (BS=1) with fresh cache per step (recompute baseline)."""
     B = 1
     device = action.device
     dtype = next(model.parameters()).dtype
@@ -103,22 +94,12 @@ def bench_heun_recompute(model, ctx_latents, ctx_actions, action, num_steps, war
     def run():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-
             for i in range(num_steps):
                 cache = _make_cache(n_ctx_tokens, device, dtype)
                 model.prefill_cache(ctx_latents, ctx_actions, cache)
                 t_val = torch.full((B,), i * dt, device=device, dtype=dtype)
-                v1 = model(x, t_val, action, cache=cache)
-
-                if i < num_steps - 1:
-                    x_euler = x + dt * v1
-                    cache2 = _make_cache(n_ctx_tokens, device, dtype)
-                    model.prefill_cache(ctx_latents, ctx_actions, cache2)
-                    t_next = torch.full((B,), (i + 1) * dt, device=device, dtype=dtype)
-                    v2 = model(x_euler, t_next, action, cache=cache2)
-                    x = x + dt * 0.5 * (v1 + v2)
-                else:
-                    x = x + dt * v1
+                v = model(x, t_val, action, cache=cache)
+                x = x + dt * v
             return x
 
     for _ in range(warmup):
@@ -325,8 +306,8 @@ def bench_ungraphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
 
 
 @torch.no_grad()
-def bench_graphed_heun(model, ctx_latents, ctx_actions, action, warmup, repeats, num_steps):
-    """Graph-replayed Heun solver: 1 graph launch replaces 2*num_steps-1 kernel storms."""
+def bench_graphed_euler_bs1(model, ctx_latents, ctx_actions, action, warmup, repeats, num_steps):
+    """Graph-replayed Euler solver (BS=1): 1 graph launch replaces num_steps kernel storms."""
     device = ctx_latents.device
     dtype  = next(model.parameters()).dtype
     n_ctx  = ctx_latents.shape[1]
@@ -477,6 +458,10 @@ def main():
     dtype = torch.float16
 
     model = DiTSmall().to(device=device, dtype=dtype).eval()
+    ckpt = torch.load("offline_best.pt", map_location=device, weights_only=False)
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(state_dict)
+
     B = 1
     ctx_latents = torch.randn(B, args.n_ctx, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
     ctx_actions = torch.randn(B, ACTION_DIM, device=device, dtype=dtype)
@@ -490,20 +475,20 @@ def main():
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     print()
 
-    # --- Heun benchmarks ---
-    times_heun_cached = bench_heun_cached(
+    # --- Euler BS=1 benchmarks ---
+    times_euler_cached = bench_euler_cached_bs1(
         model, ctx_latents, ctx_actions, action,
         args.num_steps, args.warmup, args.repeats,
     )
-    times_heun_recompute = bench_heun_recompute(
+    times_euler_recompute = bench_euler_recompute_bs1(
         model, ctx_latents, ctx_actions, action,
         args.num_steps, args.warmup, args.repeats,
     )
 
-    n_heun_evals = 2 * args.num_steps - 1
-    mean_heun_cached    = sum(times_heun_cached)    / len(times_heun_cached)
-    mean_heun_recompute = sum(times_heun_recompute) / len(times_heun_recompute)
-    heun_speedup        = mean_heun_recompute / mean_heun_cached
+    n_euler_evals_bs1    = args.num_steps
+    mean_euler_cached    = sum(times_euler_cached)    / len(times_euler_cached)
+    mean_euler_recompute = sum(times_euler_recompute) / len(times_euler_recompute)
+    euler_bs1_speedup    = mean_euler_recompute / mean_euler_cached
 
     # --- CEM benchmarks ---
     times_cem_recompute = bench_cem_recompute(
@@ -532,13 +517,13 @@ def main():
 
     W = 62
     print("=" * W)
-    print(f"  Single Inference Step  (Heun, BS=1, {n_heun_evals} evals)")
+    print(f"  Single Inference Step  (Euler, BS=1, {n_euler_evals_bs1} evals)")
     print(f"{'Metric':<35} {'Cached':>10} {'Recompute':>10}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_heun_cached:>10.2f} {mean_heun_recompute:>10.2f}")
-    print(f"{'ms/step':<35} {mean_heun_cached/args.num_steps:>10.2f} {mean_heun_recompute/args.num_steps:>10.2f}")
-    print(f"{'ms/model_eval':<35} {mean_heun_cached/n_heun_evals:>10.2f} {mean_heun_recompute/n_heun_evals:>10.2f}")
-    print(f"{'Speedup':<35} {heun_speedup:>10.2f}x")
+    print(f"{'Total (ms)':<35} {mean_euler_cached:>10.2f} {mean_euler_recompute:>10.2f}")
+    print(f"{'ms/step':<35} {mean_euler_cached/args.num_steps:>10.2f} {mean_euler_recompute/args.num_steps:>10.2f}")
+    print(f"{'ms/model_eval':<35} {mean_euler_cached/n_euler_evals_bs1:>10.2f} {mean_euler_recompute/n_euler_evals_bs1:>10.2f}")
+    print(f"{'Speedup':<35} {euler_bs1_speedup:>10.2f}x")
     print("=" * W)
     print(f"  CEM Planning Step  (N={args.n_candidates}, H={args.horizon}, "
           f"iters={args.n_cem_iters}, {n_cem_evals} evals @ BS={args.n_candidates})")
@@ -553,15 +538,15 @@ def main():
 
     # Markdown block for results.md
     print("\n--- Markdown (copy to results.md) ---\n")
-    print("### Heun Solver (BS=1)")
+    print("### Euler Solver (BS=1)")
     print(f"| Solver | Total (ms) | ms/step | ms/eval | Speedup |")
     print(f"|--------|-----------|---------|---------|---------|")
-    print(f"| Heun (KV-cached)   | {mean_heun_cached:.2f} | "
-          f"{mean_heun_cached/args.num_steps:.2f} | "
-          f"{mean_heun_cached/n_heun_evals:.2f} | **{heun_speedup:.2f}x** |")
-    print(f"| Heun (recompute)   | {mean_heun_recompute:.2f} | "
-          f"{mean_heun_recompute/args.num_steps:.2f} | "
-          f"{mean_heun_recompute/n_heun_evals:.2f} | 1.00x |")
+    print(f"| Euler (KV-cached)  | {mean_euler_cached:.2f} | "
+          f"{mean_euler_cached/args.num_steps:.2f} | "
+          f"{mean_euler_cached/n_euler_evals_bs1:.2f} | **{euler_bs1_speedup:.2f}x** |")
+    print(f"| Euler (recompute)  | {mean_euler_recompute:.2f} | "
+          f"{mean_euler_recompute/args.num_steps:.2f} | "
+          f"{mean_euler_recompute/n_euler_evals_bs1:.2f} | 1.00x |")
     print()
     print(f"### CEM-MPC Planning Step (N={args.n_candidates}, H={args.horizon}, "
           f"iters={args.n_cem_iters}, ode={args.cem_ode_steps})")
@@ -587,49 +572,49 @@ def main():
         n_candidates=args.n_candidates,
         num_ode_steps=args.cem_ode_steps,
     )
-    times_graphed_heun = bench_graphed_heun(
+    times_graphed_euler_bs1 = bench_graphed_euler_bs1(
         model, ctx_latents, ctx_actions, action,
         args.warmup, args.repeats,
         num_steps=args.num_steps,
     )
 
-    mean_graphed_euler   = sum(times_graphed_euler)   / len(times_graphed_euler)
-    mean_ungraphed_euler = sum(times_ungraphed_euler) / len(times_ungraphed_euler)
-    mean_graphed_heun    = sum(times_graphed_heun)    / len(times_graphed_heun)
-    euler_graph_speedup  = mean_ungraphed_euler / mean_graphed_euler
-    heun_graph_speedup   = mean_heun_recompute  / mean_graphed_heun
+    mean_graphed_euler_N     = sum(times_graphed_euler)      / len(times_graphed_euler)
+    mean_ungraphed_euler_N   = sum(times_ungraphed_euler)    / len(times_ungraphed_euler)
+    mean_graphed_euler_bs1   = sum(times_graphed_euler_bs1)  / len(times_graphed_euler_bs1)
+    euler_N_graph_speedup    = mean_ungraphed_euler_N / mean_graphed_euler_N
+    euler_bs1_graph_speedup  = mean_euler_cached      / mean_graphed_euler_bs1
 
-    n_euler_evals = args.cem_ode_steps
+    n_euler_evals_N = args.cem_ode_steps
 
     print()
     print("=" * W)
     print(f"  CUDA Graph vs Eager  (Euler step, N={args.n_candidates}, ode={args.cem_ode_steps})")
     print(f"{'Metric':<35} {'Graphed':>10} {'Eager':>10}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_graphed_euler:>10.2f} {mean_ungraphed_euler:>10.2f}")
-    print(f"{'ms/model_eval':<35} {mean_graphed_euler/n_euler_evals:>10.2f} {mean_ungraphed_euler/n_euler_evals:>10.2f}")
-    print(f"{'Speedup':<35} {euler_graph_speedup:>10.2f}x")
+    print(f"{'Total (ms)':<35} {mean_graphed_euler_N:>10.2f} {mean_ungraphed_euler_N:>10.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_euler_N/n_euler_evals_N:>10.2f} {mean_ungraphed_euler_N/n_euler_evals_N:>10.2f}")
+    print(f"{'Speedup':<35} {euler_N_graph_speedup:>10.2f}x")
     print("=" * W)
-    print(f"  CUDA Graph vs Eager  (Heun BS=1, steps={args.num_steps}, {n_heun_evals} evals)")
+    print(f"  CUDA Graph vs Eager  (Euler BS=1, steps={args.num_steps}, {n_euler_evals_bs1} evals)")
     print(f"{'Metric':<35} {'Graphed':>10} {'Eager KV':>10}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_graphed_heun:>10.2f} {mean_heun_cached:>10.2f}")
-    print(f"{'ms/model_eval':<35} {mean_graphed_heun/n_heun_evals:>10.2f} {mean_heun_cached/n_heun_evals:>10.2f}")
-    print(f"{'Speedup vs KV-cached eager':<35} {heun_graph_speedup:>10.2f}x")
+    print(f"{'Total (ms)':<35} {mean_graphed_euler_bs1:>10.2f} {mean_euler_cached:>10.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_euler_bs1/n_euler_evals_bs1:>10.2f} {mean_euler_cached/n_euler_evals_bs1:>10.2f}")
+    print(f"{'Speedup vs KV-cached eager':<35} {euler_bs1_graph_speedup:>10.2f}x")
     print("=" * W)
 
     print()
     print(f"### CUDA Graph Speedup")
     print(f"| Solver | Total (ms) | ms/eval | Speedup vs eager |")
     print(f"|--------|-----------|---------|-----------------|")
-    print(f"| Euler step graphed (N={args.n_candidates}) | {mean_graphed_euler:.2f} | "
-          f"{mean_graphed_euler/n_euler_evals:.2f} | **{euler_graph_speedup:.2f}x** |")
-    print(f"| Euler step eager               | {mean_ungraphed_euler:.2f} | "
-          f"{mean_ungraphed_euler/n_euler_evals:.2f} | 1.00x |")
-    print(f"| Heun graphed (BS=1)            | {mean_graphed_heun:.2f} | "
-          f"{mean_graphed_heun/n_heun_evals:.2f} | **{heun_graph_speedup:.2f}x** |")
-    print(f"| Heun KV-cached eager           | {mean_heun_cached:.2f} | "
-          f"{mean_heun_cached/n_heun_evals:.2f} | 1.00x |")
+    print(f"| Euler graphed (N={args.n_candidates})    | {mean_graphed_euler_N:.2f} | "
+          f"{mean_graphed_euler_N/n_euler_evals_N:.2f} | **{euler_N_graph_speedup:.2f}x** |")
+    print(f"| Euler eager   (N={args.n_candidates})    | {mean_ungraphed_euler_N:.2f} | "
+          f"{mean_ungraphed_euler_N/n_euler_evals_N:.2f} | 1.00x |")
+    print(f"| Euler graphed (BS=1)           | {mean_graphed_euler_bs1:.2f} | "
+          f"{mean_graphed_euler_bs1/n_euler_evals_bs1:.2f} | **{euler_bs1_graph_speedup:.2f}x** |")
+    print(f"| Euler KV-cached eager (BS=1)   | {mean_euler_cached:.2f} | "
+          f"{mean_euler_cached/n_euler_evals_bs1:.2f} | 1.00x |")
 
     # --- Slide benchmarks ---
     times_slide_phys = bench_slide_physical(

@@ -273,8 +273,9 @@ class DiTBlock(nn.Module):
             v = v.view(B, N, NUM_HEADS, HEAD_DIM).transpose(1, 2)
 
             if cache is not None:
-                cache.update(layer_idx, k, v)
-                k, v = cache.get_kv(layer_idx)
+                k_ctx, v_ctx = cache.get_kv(layer_idx)          # [1, H, n_ctx, d]
+                k = torch.cat([k_ctx.expand(B, -1, -1, -1), k], dim=2)  # [B, H, n_total, d]
+                v = torch.cat([v_ctx.expand(B, -1, -1, -1), v], dim=2)
 
             attn = F.scaled_dot_product_attention(q, k, v)  # [B, 6, N_kv, 64]
             attn = attn.transpose(1, 2).reshape(B, N, D)  # [B, N, D]

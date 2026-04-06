@@ -210,8 +210,6 @@ class GraphedHeunSolver:
 
         # --- Pre-allocated static buffers ---
         self.x      = torch.empty(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-        # Predictor scratch buffer for Heun corrector step (x + dt*v1).
-        self.x_pred = torch.empty(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
         self.action = torch.empty(B, ACTION_DIM, device=device, dtype=dtype)
         self.t_buf  = torch.empty(B, device=device, dtype=dtype)
 
@@ -235,25 +233,11 @@ class GraphedHeunSolver:
         dt = self._dt
 
         def _loop() -> None:
-            """Unrolled Heun ODE — captured as CUDA graph.
-
-            Python 'if i < num_steps - 1' is evaluated at capture time and
-            baked into the graph as a flat sequence of ops (no runtime branch).
-            """
+            """Unrolled Euler ODE — captured as CUDA graph."""
             for i in range(num_steps):
                 self.t_buf.fill_(i * dt)
-                v1 = model(self.x, self.t_buf, self.action, cache=self.cache)
-                if i < num_steps - 1:
-                    # Predictor: x_pred = x + dt * v1
-                    torch.add(self.x, v1, alpha=dt, out=self.x_pred)
-                    self.t_buf.fill_((i + 1) * dt)
-                    v2 = model(self.x_pred, self.t_buf, self.action, cache=self.cache)
-                    # Corrector: x += dt/2 * (v1 + v2)
-                    v1.add_(v2)
-                    self.x.add_(v1, alpha=dt * 0.5)
-                else:
-                    # Final step: plain Euler (no corrector needed)
-                    self.x.add_(v1, alpha=dt)
+                v = model(self.x, self.t_buf, self.action, cache=self.cache)
+                self.x.add_(v, alpha=dt)
 
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
