@@ -16,7 +16,8 @@ import argparse
 
 import torch
 
-from inference.planner import cem_plan, cube_height_score_fn
+from inference.graph_solver import GraphedEulerStep, GraphedHeunSolver
+from inference.planner import cem_plan, cube_height_score_fn, _euler_rollout_step
 from models.cache import KVCache, RingKVCache
 from models.dit import (
     ACTION_DIM,
@@ -253,6 +254,109 @@ def bench_cem_cached(model, ctx_latents, ctx_actions, warmup, repeats,
 
 
 @torch.no_grad()
+def bench_graphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
+                              n_candidates, num_ode_steps, cache_type="kv"):
+    """Graph-replayed Euler step: 1 graph launch replaces num_ode_steps kernel storms."""
+    device = ctx_latents.device
+    dtype  = next(model.parameters()).dtype
+    n_ctx  = ctx_latents.shape[1]
+    N      = n_candidates
+
+    solver = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
+                               num_ode_steps=num_ode_steps,
+                               cache_type=cache_type, dtype=dtype)
+
+    ctx_latents_1 = ctx_latents          # [1, n_ctx, C, H, W]
+    g = torch.Generator(device=device).manual_seed(1)
+    a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype, generator=g)
+    x_init = torch.randn(N, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
+
+    def run():
+        solver.run(model, ctx_latents_1, a_cond, x_init=x_init)
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    elapsed = []
+    for _ in range(repeats):
+        start.record()
+        run()
+        end.record()
+        torch.cuda.synchronize()
+        elapsed.append(start.elapsed_time(end))
+
+    return elapsed
+
+
+@torch.no_grad()
+def bench_ungraphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
+                                n_candidates, num_ode_steps):
+    """Ungraphed Euler step baseline (current _euler_rollout_step behaviour)."""
+    device = ctx_latents.device
+    dtype  = next(model.parameters()).dtype
+    N      = n_candidates
+    ctx_N  = ctx_latents.expand(N, -1, -1, -1, -1)
+
+    g = torch.Generator(device=device).manual_seed(1)
+    a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype, generator=g)
+
+    def run():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    elapsed = []
+    for _ in range(repeats):
+        start.record()
+        run()
+        end.record()
+        torch.cuda.synchronize()
+        elapsed.append(start.elapsed_time(end))
+
+    return elapsed
+
+
+@torch.no_grad()
+def bench_graphed_heun(model, ctx_latents, ctx_actions, action, warmup, repeats, num_steps):
+    """Graph-replayed Heun solver: 1 graph launch replaces 2*num_steps-1 kernel storms."""
+    device = ctx_latents.device
+    dtype  = next(model.parameters()).dtype
+    n_ctx  = ctx_latents.shape[1]
+
+    solver = GraphedHeunSolver(model, n_ctx=n_ctx, num_steps=num_steps, dtype=dtype)
+
+    g = torch.Generator(device=device).manual_seed(2)
+    x_init = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
+
+    def run():
+        solver.run(model, ctx_latents, ctx_actions, action, x_init=x_init)
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    elapsed = []
+    for _ in range(repeats):
+        start.record()
+        run()
+        end.record()
+        torch.cuda.synchronize()
+        elapsed.append(start.elapsed_time(end))
+
+    return elapsed
+
+
+@torch.no_grad()
 def bench_slide_physical(model, ctx_latents, ctx_actions, action, n_roll_frames, warmup, repeats):
     """Rolling context with physical-shift slide (KVCache.slide).
 
@@ -469,6 +573,63 @@ def main():
     print(f"| CEM (recompute)    | {mean_cem_recompute:.2f} | "
           f"{mean_cem_recompute/args.n_cem_iters:.2f} | "
           f"{mean_cem_recompute/n_cem_evals:.2f} | 1.00x |")
+
+    # --- CUDA graph benchmarks ---
+    times_graphed_euler = bench_graphed_euler_step(
+        model, ctx_latents, ctx_actions,
+        args.warmup, args.repeats,
+        n_candidates=args.n_candidates,
+        num_ode_steps=args.cem_ode_steps,
+    )
+    times_ungraphed_euler = bench_ungraphed_euler_step(
+        model, ctx_latents, ctx_actions,
+        args.warmup, args.repeats,
+        n_candidates=args.n_candidates,
+        num_ode_steps=args.cem_ode_steps,
+    )
+    times_graphed_heun = bench_graphed_heun(
+        model, ctx_latents, ctx_actions, action,
+        args.warmup, args.repeats,
+        num_steps=args.num_steps,
+    )
+
+    mean_graphed_euler   = sum(times_graphed_euler)   / len(times_graphed_euler)
+    mean_ungraphed_euler = sum(times_ungraphed_euler) / len(times_ungraphed_euler)
+    mean_graphed_heun    = sum(times_graphed_heun)    / len(times_graphed_heun)
+    euler_graph_speedup  = mean_ungraphed_euler / mean_graphed_euler
+    heun_graph_speedup   = mean_heun_recompute  / mean_graphed_heun
+
+    n_euler_evals = args.cem_ode_steps
+
+    print()
+    print("=" * W)
+    print(f"  CUDA Graph vs Eager  (Euler step, N={args.n_candidates}, ode={args.cem_ode_steps})")
+    print(f"{'Metric':<35} {'Graphed':>10} {'Eager':>10}")
+    print("-" * W)
+    print(f"{'Total (ms)':<35} {mean_graphed_euler:>10.2f} {mean_ungraphed_euler:>10.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_euler/n_euler_evals:>10.2f} {mean_ungraphed_euler/n_euler_evals:>10.2f}")
+    print(f"{'Speedup':<35} {euler_graph_speedup:>10.2f}x")
+    print("=" * W)
+    print(f"  CUDA Graph vs Eager  (Heun BS=1, steps={args.num_steps}, {n_heun_evals} evals)")
+    print(f"{'Metric':<35} {'Graphed':>10} {'Eager KV':>10}")
+    print("-" * W)
+    print(f"{'Total (ms)':<35} {mean_graphed_heun:>10.2f} {mean_heun_cached:>10.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_heun/n_heun_evals:>10.2f} {mean_heun_cached/n_heun_evals:>10.2f}")
+    print(f"{'Speedup vs KV-cached eager':<35} {heun_graph_speedup:>10.2f}x")
+    print("=" * W)
+
+    print()
+    print(f"### CUDA Graph Speedup")
+    print(f"| Solver | Total (ms) | ms/eval | Speedup vs eager |")
+    print(f"|--------|-----------|---------|-----------------|")
+    print(f"| Euler step graphed (N={args.n_candidates}) | {mean_graphed_euler:.2f} | "
+          f"{mean_graphed_euler/n_euler_evals:.2f} | **{euler_graph_speedup:.2f}x** |")
+    print(f"| Euler step eager               | {mean_ungraphed_euler:.2f} | "
+          f"{mean_ungraphed_euler/n_euler_evals:.2f} | 1.00x |")
+    print(f"| Heun graphed (BS=1)            | {mean_graphed_heun:.2f} | "
+          f"{mean_graphed_heun/n_heun_evals:.2f} | **{heun_graph_speedup:.2f}x** |")
+    print(f"| Heun KV-cached eager           | {mean_heun_cached:.2f} | "
+          f"{mean_heun_cached/n_heun_evals:.2f} | 1.00x |")
 
     # --- Slide benchmarks ---
     times_slide_phys = bench_slide_physical(

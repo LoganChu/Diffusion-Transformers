@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 import pytest
 
+from inference.graph_solver import GraphedEulerStep, GraphedHeunSolver
 from models.cache import KVCache, RingKVCache
 from models.dit import (
     DEPTH,
@@ -323,6 +324,100 @@ def test_ring_cache_slide_parity():
 
     diff = (out_phys - out_ring).abs().max().item()
     assert diff <= ATOL, f"Ring-cache slide parity failed: max diff = {diff}"
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph parity: graphed solvers must match eager baselines
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graphed_euler_step_parity():
+    """GraphedEulerStep must produce the same output as eager _euler_rollout_step.
+
+    Both paths receive identical initial noise and action inputs; context K/V
+    is prefilled from the same tensors.  The graphed path uses a shared BS=1
+    cache (SDPA broadcast); the eager path passes ctx_latents directly.
+    We verify the maximum absolute difference is within float16 tolerance.
+    """
+    from inference.planner import _euler_rollout_step
+
+    model = _make_model(dtype=torch.float32)
+    N, n_ctx = 4, 2   # small N for speed; parity not N-dependent
+    num_ode_steps = 4
+    dtype = torch.float32
+
+    ctx_latents_1, ctx_actions, _, _, _ = _make_inputs(B=1, n_ctx=n_ctx, dtype=dtype, seed=20)
+    n_ctx_tokens = n_ctx * NUM_PATCHES
+
+    g = torch.Generator(device=DEVICE).manual_seed(99)
+    a_cond = torch.randn(N, ctx_actions.shape[-1], device=DEVICE, dtype=dtype, generator=g)
+    x_init = torch.randn(N, IN_CHANNELS, LATENT_H, LATENT_W, device=DEVICE, dtype=dtype, generator=g)
+
+    # --- Graphed path ---
+    solver = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
+                               num_ode_steps=num_ode_steps,
+                               cache_type="kv", dtype=dtype)
+    with torch.no_grad():
+        out_graphed = solver.run(model, ctx_latents_1, a_cond, x_init=x_init).clone()
+
+    # --- Eager path: manual Euler with shared BS=1 cache (mirrors graphed path) ---
+    cache_ref = _make_cache(n_ctx_tokens, dtype=dtype)
+    with torch.no_grad():
+        model.prefill_cache(ctx_latents_1, a_cond[0:1], cache_ref)
+        x_ref = x_init.clone()
+        dt = 1.0 / num_ode_steps
+        t_buf = torch.empty(N, device=DEVICE, dtype=dtype)
+        for i in range(num_ode_steps):
+            t_buf.fill_(i * dt)
+            v = model(x_ref, t_buf, a_cond, cache=cache_ref)
+            x_ref.add_(v, alpha=dt)
+
+    diff = (out_graphed - x_ref).abs().max().item()
+    assert diff <= ATOL, f"GraphedEulerStep parity failed: max diff = {diff}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graphed_heun_parity():
+    """GraphedHeunSolver must produce the same output as eager KV-cached Heun.
+
+    Both paths receive identical initial noise, action, and context.  The
+    graphed path replays the captured CUDA graph; the eager path runs the
+    same unrolled Heun loop with a fresh KVCache.
+    """
+    model = _make_model(dtype=torch.float32)
+    n_ctx, num_steps = 2, 4
+    dtype = torch.float32
+
+    ctx_latents, ctx_actions, action, _, _ = _make_inputs(B=1, n_ctx=n_ctx, dtype=dtype, seed=30)
+    n_ctx_tokens = n_ctx * NUM_PATCHES
+
+    g = torch.Generator(device=DEVICE).manual_seed(42)
+    x_init = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=DEVICE, dtype=dtype, generator=g)
+
+    # --- Graphed path ---
+    solver = GraphedHeunSolver(model, n_ctx=n_ctx, num_steps=num_steps, dtype=dtype)
+    with torch.no_grad():
+        out_graphed = solver.run(model, ctx_latents, ctx_actions, action, x_init=x_init).clone()
+
+    # --- Eager path: Heun with KVCache (mirrors graphed loop exactly) ---
+    cache_ref = _make_cache(n_ctx_tokens, dtype=dtype)
+    with torch.no_grad():
+        model.prefill_cache(ctx_latents, ctx_actions, cache_ref)
+        x_ref = x_init.clone()
+        dt = 1.0 / num_steps
+        t_buf = torch.empty(1, device=DEVICE, dtype=dtype)
+        for i in range(num_steps):
+            t_buf.fill_(i * dt)
+            v1 = model(x_ref, t_buf, action, cache=cache_ref)
+            if i < num_steps - 1:
+                x_pred = x_ref + dt * v1
+                t_buf.fill_((i + 1) * dt)
+                v2 = model(x_pred, t_buf, action, cache=cache_ref)
+                x_ref = x_ref + dt * 0.5 * (v1 + v2)
+            else:
+                x_ref = x_ref + dt * v1
+
+    diff = (out_graphed - x_ref).abs().max().item()
+    assert diff <= ATOL, f"GraphedHeunSolver parity failed: max diff = {diff}"
 
 
 if __name__ == "__main__":

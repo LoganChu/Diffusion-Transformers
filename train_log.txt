@@ -1,0 +1,20 @@
+C:\Users\s-lch\anaconda3\envs\ml_env\lib\site-packages\sapien\wrapper\pinocchio_model.py:254: UserWarning: Deprecated member. Use Frame.parentJoint instead.
+  joint = self.model.frames[frame].parent
+
+ERROR conda.cli.main_run:execute(125): `conda run python -m training.train_online --resume offline_best.pt --hdf5 trajectories_10k.h5 --score_fn maniskill_reward --backbone_lr_scale 0.1 --replay_capacity 10000 --n_episodes 200 --no_wandb` failed. (See above for error)
+
+Model params: 32,969,158
+Backbone lr: 3.00e-05  Head lr: 3.00e-04
+[ReplayBuffer] seeded 32,891 transitions from trajectories_10k.h5 (10,000/10,000 total)
+Resumed from offline_best.pt (episode 0)
+
+Pre-training task heads for 2000 steps on offline data (backbone frozen) ...
+  [  400/2000]  r=0.0170  done=0.0000  val=88.7246
+  [  800/2000]  r=0.0078  done=0.0000  val=78.4617
+  [ 1200/2000]  r=0.0112  done=0.0000  val=73.1723
+  [ 1600/2000]  r=0.0077  done=0.0000  val=70.5583
+  [ 2000/2000]  r=0.0086  done=0.0000  val=67.8600
+Head pretraining complete.
+
+CEM score function: maniskill_reward
+
