@@ -202,7 +202,7 @@ def parse_args():
     p.add_argument("--n_candidates",  type=int,   default=32)
     p.add_argument("--n_elites",      type=int,   default=6)
     p.add_argument("--n_cem_iters",   type=int,   default=3)
-    p.add_argument("--num_ode_steps", type=int,   default=4)
+    p.add_argument("--num_ode_steps", type=int,   default=10)
     p.add_argument("--n_ctx",         type=int,   default=4)
     p.add_argument("--verbose",       action="store_true")
     return p.parse_args()

@@ -206,7 +206,7 @@ def cem_plan(
     n_elites: int = 8,
     n_cem_iters: int = 3,
     gamma: float = 0.99,
-    num_ode_steps: int = 4,
+    num_ode_steps: int = 10,
     action_lo: torch.Tensor | None = None,
     action_hi: torch.Tensor | None = None,
     noise_std_init: float = 0.05,

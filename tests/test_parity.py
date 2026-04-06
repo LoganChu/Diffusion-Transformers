@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from models.cache import KVCache
+from models.cache import KVCache, RingKVCache
 from models.dit import (
     DEPTH,
     HEAD_DIM,
@@ -211,6 +211,49 @@ def test_heun_multistep_parity():
 
 
 # ---------------------------------------------------------------------------
+# CEM regime: shared BS=1 cache broadcasts correctly to N candidates
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cem_shared_cache_parity():
+    """BS=1 context cache must broadcast correctly to N parallel candidates.
+
+    In the CEM planner all N candidates observe identical context, so a single
+    BS=1 KVCache is prefilled once and shared.  SDPA broadcasts the context
+    K/V [1, heads, n_ctx, hd] against per-candidate query tensors
+    [N, heads, n_denoise, hd].  This test verifies the broadcast gives
+    identical results to N independent BS=1 forward passes.
+    """
+    model = _make_model()
+    N, n_ctx = 8, 2
+    dtype = torch.float32
+
+    ctx_latents_1, ctx_actions, _, _, _ = _make_inputs(B=1, n_ctx=n_ctx, dtype=dtype, seed=5)
+    n_ctx_tokens = n_ctx * NUM_PATCHES
+
+    g = torch.Generator(device=DEVICE).manual_seed(77)
+    x_N = torch.randn(N, IN_CHANNELS, LATENT_H, LATENT_W, device=DEVICE, dtype=dtype, generator=g)
+    a_N = torch.randn(N, ctx_actions.shape[-1], device=DEVICE, dtype=dtype, generator=g)
+    t_N = torch.rand(N, device=DEVICE, dtype=dtype, generator=g)
+
+    with torch.no_grad():
+        # --- Batched path: shared BS=1 cache, N candidates in one forward ---
+        cache_shared = _make_cache(n_ctx_tokens, dtype=dtype)
+        model.prefill_cache(ctx_latents_1, ctx_actions, cache_shared)
+        out_batched = model(x_N, t_N, a_N, cache=cache_shared)   # [N, 16, 8, 8]
+
+        # --- Reference: N independent BS=1 forward passes, fresh cache each ---
+        out_ref = []
+        for i in range(N):
+            cache_i = _make_cache(n_ctx_tokens, dtype=dtype)
+            model.prefill_cache(ctx_latents_1, ctx_actions, cache_i)
+            out_ref.append(model(x_N[i:i+1], t_N[i:i+1], a_N[i:i+1], cache=cache_i))
+        out_ref = torch.cat(out_ref, dim=0)   # [N, 16, 8, 8]
+
+    diff = (out_batched - out_ref).abs().max().item()
+    assert diff <= ATOL, f"CEM shared-cache parity failed: max diff = {diff}"
+
+
+# ---------------------------------------------------------------------------
 # Backward compat: forward without cache matches original behaviour
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -225,6 +268,61 @@ def test_forward_no_cache_unchanged():
 
     diff = (out1 - out2).abs().max().item()
     assert diff == 0.0, f"Cacheless forward not deterministic: diff = {diff}"
+
+
+# ---------------------------------------------------------------------------
+# Ring-buffer KV cache: slide parity against physical-shift KVCache
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_ring_cache_slide_parity():
+    """After K slides, RingKVCache forward output must match KVCache forward output.
+
+    Verifies that full-attention SDPA is permutation-invariant over context K/V:
+    the ring buffer's non-chronological physical layout does not affect the
+    attention result.  K=n_ctx ensures at least one full wrap-around of the ring.
+    """
+    model = _make_model()
+    n_ctx, n_slides = 2, 4   # n_slides > n_ctx exercises wrap-around
+    dtype = torch.float32
+
+    ctx_latents, ctx_actions, action, x, t = _make_inputs(B=1, n_ctx=n_ctx, dtype=dtype, seed=11)
+    n_ctx_tokens  = n_ctx * NUM_PATCHES
+    n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
+
+    # Seeded new-frame K/V — identical for both caches
+    g = torch.Generator(device=DEVICE).manual_seed(55)
+    new_frame_kvs = [
+        (
+            torch.randn(*n_frame_shape, device=DEVICE, dtype=dtype, generator=g),
+            torch.randn(*n_frame_shape, device=DEVICE, dtype=dtype, generator=g),
+        )
+        for _ in range(n_slides)
+    ]
+
+    with torch.no_grad():
+        # --- Physical-shift KVCache ---
+        cache_phys = _make_cache(n_ctx_tokens, dtype=dtype)
+        model.prefill_cache(ctx_latents, ctx_actions, cache_phys)
+        for k_new, v_new in new_frame_kvs:
+            for layer_idx in range(DEPTH):
+                cache_phys.slide(layer_idx, k_new, v_new)
+        out_phys = model(x, t, action, cache=cache_phys)
+
+        # --- Ring-buffer RingKVCache ---
+        cache_ring = RingKVCache(
+            DEPTH, NUM_HEADS, HEAD_DIM,
+            n_ctx_tokens, NUM_PATCHES, NUM_PATCHES,
+            device=DEVICE, dtype=dtype,
+        )
+        model.prefill_cache(ctx_latents, ctx_actions, cache_ring)
+        for k_new, v_new in new_frame_kvs:
+            for layer_idx in range(DEPTH):
+                cache_ring.slide_ring(layer_idx, k_new, v_new)
+            cache_ring.advance_head()
+        out_ring = model(x, t, action, cache=cache_ring)
+
+    diff = (out_phys - out_ring).abs().max().item()
+    assert diff <= ATOL, f"Ring-cache slide parity failed: max diff = {diff}"
 
 
 if __name__ == "__main__":
