@@ -1,13 +1,15 @@
-"""Benchmark: KV-cache speedup for single-step Heun inference and CEM-MPC planning.
+"""Benchmark: KV-cache speedup for single-step inference and MPC candidate rollouts.
 
 Two comparisons, both measuring cached vs. recompute:
-  1. Single Heun step (BS=1, 8 ODE steps) — high-quality inference regime.
-  2. CEM planning step (N=64, H=6, 3 iters, 4 ODE steps) — planning regime.
+  1. Single Euler step (BS=1, 8 ODE steps) — reactive control regime.
+  2. Single MPC step (N=64, 4 ODE steps) — planning regime.
+     One prefill → N candidates × ode_steps evals is the atomic unit the cache
+     accelerates. Horizon and CEM iteration loops are excluded — they add no
+     additional cache utilization (same speedup ratio at every step).
 
 Usage:
     python -m inference.bench [--num_steps 8] [--n_ctx 2] [--warmup 5] [--repeats 50]
-                              [--horizon 6] [--n_candidates 64] [--n_elites 8]
-                              [--n_cem_iters 3] [--cem_ode_steps 4]
+                              [--n_candidates 64] [--cem_ode_steps 4]
 """
 
 from __future__ import annotations
@@ -121,20 +123,24 @@ def bench_euler_recompute_bs1(model, ctx_latents, ctx_actions, action, num_steps
 
 
 @torch.no_grad()
-def bench_cem_recompute(model, ctx_latents, ctx_actions, warmup, repeats,
-                        horizon, n_candidates, n_elites, n_cem_iters, num_ode_steps):
-    """CEM planning step — recompute baseline (context K/V recomputed every ODE step)."""
+def bench_mpc_recompute(model, ctx_latents, ctx_actions, warmup, repeats,
+                        n_candidates, num_ode_steps):
+    """Single MPC step — recompute baseline (context K/V recomputed every ODE step).
+
+    Times one rollout of N candidates with no caching: context is re-encoded
+    at every ODE step for every candidate via _euler_rollout_step.
+    One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
+    """
+    device = ctx_latents.device
+    dtype  = next(model.parameters()).dtype
+    N      = n_candidates
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+
     def run():
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            return cem_plan(
-                model, ctx_latents, ctx_actions,
-                score_fn=cube_height_score_fn,
-                horizon=horizon,
-                n_candidates=n_candidates,
-                n_elites=n_elites,
-                n_cem_iters=n_cem_iters,
-                num_ode_steps=num_ode_steps,
-            )
+            a_cond   = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
+            ctx_N    = ctx_latents.expand(N, -1, -1, -1, -1)
+            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
 
     for _ in range(warmup):
         run()
@@ -176,46 +182,23 @@ def _cached_rollout_step(model, ctx_roll, a_cond, n_ctx_tokens, num_ode_steps, d
 
 
 @torch.no_grad()
-def bench_cem_cached(model, ctx_latents, ctx_actions, warmup, repeats,
-                     horizon, n_candidates, n_elites, n_cem_iters, num_ode_steps):
-    """CEM planning step — KV-cached (context prefilled once per horizon step)."""
+def bench_mpc_cached(model, ctx_latents, ctx_actions, warmup, repeats,
+                     n_candidates, num_ode_steps):
+    """Single MPC step — KV-cached (context prefilled once, broadcast to N candidates).
+
+    Times one rollout of N candidates with shared BS=1 context cache:
+    prefill once, SDPA broadcasts to all N candidates across all ODE steps.
+    One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
+    """
     device = ctx_latents.device
     dtype  = next(model.parameters()).dtype
-    N, H   = n_candidates, horizon
+    N      = n_candidates
     n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-
-    _ACTION_LO = torch.tensor([-0.08, -0.08, -0.08, -1.0], device=device, dtype=dtype)
-    _ACTION_HI = torch.tensor([ 0.08,  0.08,  0.08,  1.0], device=device, dtype=dtype)
 
     def run():
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            ctx_base = ctx_latents.expand(N, -1, -1, -1, -1)
-            mean = torch.zeros(H, ACTION_DIM, device=device, dtype=dtype)
-            std  = torch.full((H, ACTION_DIM), 0.05, device=device, dtype=dtype)
-            t_ones = torch.ones(N, device=device, dtype=dtype)
-
-            for _ in range(n_cem_iters):
-                eps     = torch.randn(N, H, ACTION_DIM, device=device, dtype=dtype)
-                actions = (mean.unsqueeze(0) + std.unsqueeze(0) * eps).clamp(_ACTION_LO, _ACTION_HI)
-                ctx_roll = ctx_base.clone()
-                returns  = torch.zeros(N, device=device, dtype=torch.float32)
-
-                for h in range(H):
-                    a_cond = actions[:, h, :]
-                    z_next = _cached_rollout_step(
-                        model, ctx_roll, a_cond,
-                        n_ctx_tokens, num_ode_steps, dtype,
-                    )
-                    step_score = cube_height_score_fn(model, z_next, t_ones)
-                    returns.add_(step_score * float(0.99 ** h))
-                    ctx_roll = torch.cat([ctx_roll[:, 1:], z_next.unsqueeze(1)], dim=1)
-
-                _, elite_idx  = returns.topk(n_elites)
-                elite_actions = actions[elite_idx].float()
-                mean = elite_actions.mean(dim=0).to(dtype)
-                std  = elite_actions.std(dim=0).clamp(min=0.01).to(dtype)
-
-            return mean[0].float()
+            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
+            _cached_rollout_step(model, ctx_latents, a_cond, n_ctx_tokens, num_ode_steps, dtype)
 
     for _ in range(warmup):
         run()
@@ -445,13 +428,10 @@ def main():
     parser.add_argument("--n_ctx",        type=int, default=2)
     parser.add_argument("--warmup",       type=int, default=5)
     parser.add_argument("--repeats",      type=int, default=50)
-    # CEM-MPC params
-    parser.add_argument("--horizon",       type=int, default=6)
+    # MPC params
     parser.add_argument("--n_candidates",  type=int, default=64)
-    parser.add_argument("--n_elites",      type=int, default=8)
-    parser.add_argument("--n_cem_iters",   type=int, default=3)
-    parser.add_argument("--cem_ode_steps",   type=int, default=4)
-    parser.add_argument("--n_roll_frames",   type=int, default=8)
+    parser.add_argument("--cem_ode_steps", type=int, default=4)
+    parser.add_argument("--n_roll_frames", type=int, default=8)
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -469,8 +449,7 @@ def main():
 
     print(f"Config: BS=1, n_ctx={args.n_ctx}, num_steps={args.num_steps}, "
           f"warmup={args.warmup}, repeats={args.repeats}, dtype={dtype}")
-    print(f"CEM config: N={args.n_candidates}, H={args.horizon}, K={args.n_elites}, "
-          f"iters={args.n_cem_iters}, ode_steps={args.cem_ode_steps}")
+    print(f"MPC config: N={args.n_candidates}, ode_steps={args.cem_ode_steps}")
     print(f"Roll config: n_roll_frames={args.n_roll_frames}, n_ctx={args.n_ctx}")
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     print()
@@ -490,30 +469,24 @@ def main():
     mean_euler_recompute = sum(times_euler_recompute) / len(times_euler_recompute)
     euler_bs1_speedup    = mean_euler_recompute / mean_euler_cached
 
-    # --- CEM benchmarks ---
-    times_cem_recompute = bench_cem_recompute(
+    # --- Single MPC step benchmarks ---
+    times_mpc_recompute = bench_mpc_recompute(
         model, ctx_latents, ctx_actions,
         args.warmup, args.repeats,
-        horizon=args.horizon,
         n_candidates=args.n_candidates,
-        n_elites=args.n_elites,
-        n_cem_iters=args.n_cem_iters,
         num_ode_steps=args.cem_ode_steps,
     )
-    times_cem_cached = bench_cem_cached(
+    times_mpc_cached = bench_mpc_cached(
         model, ctx_latents, ctx_actions,
         args.warmup, args.repeats,
-        horizon=args.horizon,
         n_candidates=args.n_candidates,
-        n_elites=args.n_elites,
-        n_cem_iters=args.n_cem_iters,
         num_ode_steps=args.cem_ode_steps,
     )
 
-    n_cem_evals      = args.n_cem_iters * args.horizon * args.cem_ode_steps
-    mean_cem_recompute = sum(times_cem_recompute) / len(times_cem_recompute)
-    mean_cem_cached    = sum(times_cem_cached)    / len(times_cem_cached)
-    cem_speedup        = mean_cem_recompute / mean_cem_cached
+    n_mpc_evals        = args.cem_ode_steps
+    mean_mpc_recompute = sum(times_mpc_recompute) / len(times_mpc_recompute)
+    mean_mpc_cached    = sum(times_mpc_cached)    / len(times_mpc_cached)
+    mpc_speedup        = mean_mpc_recompute / mean_mpc_cached
 
     W = 62
     print("=" * W)
@@ -525,15 +498,13 @@ def main():
     print(f"{'ms/model_eval':<35} {mean_euler_cached/n_euler_evals_bs1:>10.2f} {mean_euler_recompute/n_euler_evals_bs1:>10.2f}")
     print(f"{'Speedup':<35} {euler_bs1_speedup:>10.2f}x")
     print("=" * W)
-    print(f"  CEM Planning Step  (N={args.n_candidates}, H={args.horizon}, "
-          f"iters={args.n_cem_iters}, {n_cem_evals} evals @ BS={args.n_candidates})")
+    print(f"  Single MPC Step  (N={args.n_candidates}, {n_mpc_evals} evals @ BS={args.n_candidates})")
     print(f"{'Metric':<35} {'Cached':>10} {'Recompute':>10}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_cem_cached:>10.2f} {mean_cem_recompute:>10.2f}")
-    print(f"{'ms/CEM_iter':<35} {mean_cem_cached/args.n_cem_iters:>10.2f} {mean_cem_recompute/args.n_cem_iters:>10.2f}")
+    print(f"{'Total (ms)':<35} {mean_mpc_cached:>10.2f} {mean_mpc_recompute:>10.2f}")
     print(f"{'ms/model_eval (@ BS={:d})'.format(args.n_candidates):<35} "
-          f"{mean_cem_cached/n_cem_evals:>10.2f} {mean_cem_recompute/n_cem_evals:>10.2f}")
-    print(f"{'Speedup':<35} {cem_speedup:>10.2f}x")
+          f"{mean_mpc_cached/n_mpc_evals:>10.2f} {mean_mpc_recompute/n_mpc_evals:>10.2f}")
+    print(f"{'Speedup':<35} {mpc_speedup:>10.2f}x")
     print("=" * W)
 
     # Markdown block for results.md
@@ -548,16 +519,13 @@ def main():
           f"{mean_euler_recompute/args.num_steps:.2f} | "
           f"{mean_euler_recompute/n_euler_evals_bs1:.2f} | 1.00x |")
     print()
-    print(f"### CEM-MPC Planning Step (N={args.n_candidates}, H={args.horizon}, "
-          f"iters={args.n_cem_iters}, ode={args.cem_ode_steps})")
-    print(f"| Planner | Total (ms) | ms/iter | ms/eval | Speedup |")
-    print(f"|---------|-----------|---------|---------|---------|")
-    print(f"| CEM (KV-cached)    | {mean_cem_cached:.2f} | "
-          f"{mean_cem_cached/args.n_cem_iters:.2f} | "
-          f"{mean_cem_cached/n_cem_evals:.2f} | **{cem_speedup:.2f}x** |")
-    print(f"| CEM (recompute)    | {mean_cem_recompute:.2f} | "
-          f"{mean_cem_recompute/args.n_cem_iters:.2f} | "
-          f"{mean_cem_recompute/n_cem_evals:.2f} | 1.00x |")
+    print(f"### Single MPC Step (N={args.n_candidates}, ode={args.cem_ode_steps})")
+    print(f"| Planner | Total (ms) | ms/eval | Speedup |")
+    print(f"|---------|-----------|---------|---------|")
+    print(f"| MPC (KV-cached)    | {mean_mpc_cached:.2f} | "
+          f"{mean_mpc_cached/n_mpc_evals:.2f} | **{mpc_speedup:.2f}x** |")
+    print(f"| MPC (recompute)    | {mean_mpc_recompute:.2f} | "
+          f"{mean_mpc_recompute/n_mpc_evals:.2f} | 1.00x |")
 
     # --- CUDA graph benchmarks ---
     times_graphed_euler = bench_graphed_euler_step(
