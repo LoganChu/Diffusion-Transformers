@@ -30,7 +30,9 @@
       "Bash(ls -la \"C:/Users/s-lch/OneDrive - Duke University/Sophomore 2025-2026/Second Semester/CS 590 Systems of ML/Diffusion-Transformers\"/*.pt)",
       "Bash(kill 2656)",
       "Bash(pkill -f \"train_online\")",
-      "Bash(echo \"PID: $!\")"
+      "Bash(echo \"PID: $!\")",
+      "Bash(python -m py_compile models/cache.py inference/graph_solver.py)",
+      "Bash(python -m py_compile profiler/profile_colab.py)"
     ]
   },
   "outputStyle": "Explanatory"

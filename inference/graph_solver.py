@@ -39,6 +39,8 @@ Usage
 from __future__ import annotations
 
 import torch
+import torch.cuda.nvtx as nvtx
+from torch.profiler import record_function
 
 from models.cache import KVCache, RingKVCache
 from models.dit import (
@@ -133,14 +135,18 @@ class GraphedEulerStep:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
+            nvtx.range_push("GraphedEulerStep.warmup")
             for _ in range(_N_WARMUP):
                 _loop()
+            nvtx.range_pop()
         torch.cuda.current_stream().wait_stream(side)
 
         # Capture.
         graph = torch.cuda.CUDAGraph()
+        nvtx.range_push("GraphedEulerStep.capture")
         with torch.cuda.graph(graph, stream=side):
             _loop()
+        nvtx.range_pop()
 
         return graph
 
@@ -169,7 +175,10 @@ class GraphedEulerStep:
                     consume or copy before the next run() call).
         """
         # Context prefill — outside graph; cache state feeds into graph replay.
-        model.prefill_cache(ctx_latents_1, a_cond[0:1], self.cache)
+        nvtx.range_push("GraphedEulerStep.prefill")
+        with record_function("GraphedEulerStep.prefill"):
+            model.prefill_cache(ctx_latents_1, a_cond[0:1], self.cache)
+        nvtx.range_pop()
 
         # Copy variable inputs into pre-allocated buffers.
         self.a.copy_(a_cond)
@@ -178,7 +187,10 @@ class GraphedEulerStep:
         else:
             self.x.normal_()
 
-        self._graph.replay()
+        nvtx.range_push("GraphedEulerStep.replay")
+        with record_function("GraphedEulerStep.replay"):
+            self._graph.replay()
+        nvtx.range_pop()
         return self.x
 
 
@@ -251,13 +263,17 @@ class GraphedHeunSolver:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
+            nvtx.range_push("GraphedHeunSolver.warmup")
             for _ in range(_N_WARMUP):
                 _loop()
+            nvtx.range_pop()
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
+        nvtx.range_push("GraphedHeunSolver.capture")
         with torch.cuda.graph(graph, stream=side):
             _loop()
+        nvtx.range_pop()
 
         return graph
 
@@ -283,7 +299,10 @@ class GraphedHeunSolver:
         Returns:
             self.x: [1, C, H, W] predicted latent (in-place buffer).
         """
-        model.prefill_cache(ctx_latents, ctx_actions, self.cache)
+        nvtx.range_push("GraphedHeunSolver.prefill")
+        with record_function("GraphedHeunSolver.prefill"):
+            model.prefill_cache(ctx_latents, ctx_actions, self.cache)
+        nvtx.range_pop()
 
         self.action.copy_(action)
         if x_init is not None:
@@ -291,5 +310,8 @@ class GraphedHeunSolver:
         else:
             self.x.normal_()
 
-        self._graph.replay()
+        nvtx.range_push("GraphedHeunSolver.replay")
+        with record_function("GraphedHeunSolver.replay"):
+            self._graph.replay()
+        nvtx.range_pop()
         return self.x

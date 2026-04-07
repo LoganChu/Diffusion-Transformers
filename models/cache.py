@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 from torch.profiler import record_function
+import torch.cuda.nvtx as nvtx
 
 
 class KVCache:
@@ -35,15 +36,19 @@ class KVCache:
 
     def prefill(self, layer_idx: int, k_ctx: Tensor, v_ctx: Tensor) -> None:
         """One-time write of context K/V into the static prefix region."""
+        nvtx.range_push("KVCache.prefill")
         with record_function("KVCache.prefill"):
             self._k[layer_idx, :, :, : self.n_ctx, :].copy_(k_ctx)
             self._v[layer_idx, :, :, : self.n_ctx, :].copy_(v_ctx)
+        nvtx.range_pop()
 
     def update(self, layer_idx: int, k_den: Tensor, v_den: Tensor) -> None:
         """Per-ODE-step write of denoise K/V into the iterative region."""
+        nvtx.range_push("KVCache.update")
         with record_function("KVCache.update"):
             self._k[layer_idx, :, :, self.n_ctx :, :].copy_(k_den)
             self._v[layer_idx, :, :, self.n_ctx :, :].copy_(v_den)
+        nvtx.range_pop()
 
     def get_kv(self, layer_idx: int) -> tuple[Tensor, Tensor]:
         """Return views of the context K/V for a layer (BS=1, context tokens only)."""
@@ -65,6 +70,7 @@ class KVCache:
             k_new: [B, num_heads, n_frame_tokens, head_dim] newest frame K.
             v_new: [B, num_heads, n_frame_tokens, head_dim] newest frame V.
         """
+        nvtx.range_push("KVCache.slide")
         with record_function("KVCache.slide"):
             n_frame = k_new.shape[-2]   # tokens per frame (NUM_PATCHES = 16)
             # Shift context left by one frame: drop slot 0, open slot at end
@@ -77,11 +83,15 @@ class KVCache:
             # Write newest frame into the last context slot
             self._k[layer_idx, :, :, self.n_ctx - n_frame:self.n_ctx, :].copy_(k_new)
             self._v[layer_idx, :, :, self.n_ctx - n_frame:self.n_ctx, :].copy_(v_new)
+        nvtx.range_pop()
 
     def reset(self) -> None:
         """Zero buffers for CUDA Graph replay reuse."""
-        self._k.zero_()
-        self._v.zero_()
+        nvtx.range_push("KVCache.reset")
+        with record_function("KVCache.reset"):
+            self._k.zero_()
+            self._v.zero_()
+        nvtx.range_pop()
 
 
 class RingKVCache:
@@ -129,15 +139,19 @@ class RingKVCache:
 
     def prefill(self, layer_idx: int, k_ctx: Tensor, v_ctx: Tensor) -> None:
         """One-time write of context K/V into the static prefix region."""
+        nvtx.range_push("RingKVCache.prefill")
         with record_function("RingKVCache.prefill"):
             self._k[layer_idx, :, :, :self.n_ctx, :].copy_(k_ctx)
             self._v[layer_idx, :, :, :self.n_ctx, :].copy_(v_ctx)
+        nvtx.range_pop()
 
     def update(self, layer_idx: int, k_den: Tensor, v_den: Tensor) -> None:
         """Per-ODE-step write of denoise K/V into the iterative region."""
+        nvtx.range_push("RingKVCache.update")
         with record_function("RingKVCache.update"):
             self._k[layer_idx, :, :, self.n_ctx:, :].copy_(k_den)
             self._v[layer_idx, :, :, self.n_ctx:, :].copy_(v_den)
+        nvtx.range_pop()
 
     def get_kv(self, layer_idx: int) -> tuple[Tensor, Tensor]:
         """Return views of the context K/V for a layer (BS=1, context tokens only).
@@ -159,21 +173,29 @@ class RingKVCache:
             k_new: [B, num_heads, n_frame_tokens, head_dim] newest frame K.
             v_new: [B, num_heads, n_frame_tokens, head_dim] newest frame V.
         """
+        nvtx.range_push("RingKVCache.slide_ring")
         with record_function("RingKVCache.slide_ring"):
             slot_start = self.head * self.n_frame
             slot_end   = slot_start + self.n_frame
             self._k[layer_idx, :, :, slot_start:slot_end, :].copy_(k_new)
             self._v[layer_idx, :, :, slot_start:slot_end, :].copy_(v_new)
+        nvtx.range_pop()
 
     def advance_head(self) -> None:
         """Advance the ring pointer by one frame slot.
 
         Call once after all DEPTH layers have been updated via slide_ring().
         """
-        self.head = (self.head + 1) % self.n_frames
+        nvtx.range_push("RingKVCache.advance_head")
+        with record_function("RingKVCache.advance_head"):
+            self.head = (self.head + 1) % self.n_frames
+        nvtx.range_pop()
 
     def reset(self) -> None:
         """Zero buffers and reset ring pointer for reuse."""
-        self._k.zero_()
-        self._v.zero_()
-        self.head = 0
+        nvtx.range_push("RingKVCache.reset")
+        with record_function("RingKVCache.reset"):
+            self._k.zero_()
+            self._v.zero_()
+            self.head = 0
+        nvtx.range_pop()
