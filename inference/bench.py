@@ -48,27 +48,219 @@ def _make_cache(n_ctx_tokens: int, device, dtype, cache_type: str = "kv"):
     )
 
 
+# --- Workload factories for profiler integration ---
+# Each factory returns a callable that can be invoked repeatedly by the profiler.
 
-@torch.no_grad()
-def bench_euler_cached_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
-    """Euler (BS=1) with persistent cache (prefill once)."""
-    B = 1
+def make_workload_euler_bs1_cached(model, ctx_latents, ctx_actions, action, num_steps):
+    """Factory: returns workload callable for Euler BS=1 with KV cache."""
     device = action.device
     dtype = next(model.parameters()).dtype
     n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
     dt = 1.0 / num_steps
-    t_buf = torch.empty(B, device=device, dtype=dtype)
+    t_buf = torch.empty(1, device=device, dtype=dtype)
 
-    def run():
+    def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype)
             model.prefill_cache(ctx_latents, ctx_actions, cache)
-            x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
+            x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
             for i in range(num_steps):
                 t_buf.fill_(i * dt)
                 v = model(x, t_buf, action, cache=cache)
                 x.add_(v, alpha=dt)
-            return x
+
+    return workload
+
+
+def make_workload_euler_bs1_cached_ring(model, ctx_latents, ctx_actions, action, num_steps):
+    """Factory: returns workload callable for Euler BS=1 with ring-buffer cache."""
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+    dt = 1.0 / num_steps
+    t_buf = torch.empty(1, device=device, dtype=dtype)
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
+            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
+            for i in range(num_steps):
+                t_buf.fill_(i * dt)
+                v = model(x, t_buf, action, cache=cache)
+                x.add_(v, alpha=dt)
+
+    return workload
+
+
+def make_workload_euler_bs1_recompute(model, ctx_latents, ctx_actions, action, num_steps):
+    """Factory: returns workload callable for Euler BS=1 with recompute baseline."""
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+    dt = 1.0 / num_steps
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
+            for i in range(num_steps):
+                cache = _make_cache(n_ctx_tokens, device, dtype)
+                model.prefill_cache(ctx_latents, ctx_actions, cache)
+                t_val = torch.full((1,), i * dt, device=device, dtype=dtype)
+                v = model(x, t_val, action, cache=cache)
+                x = x + dt * v
+
+    return workload
+
+
+def make_workload_mpc_recompute(model, ctx_latents, n_candidates, num_ode_steps):
+    """Factory: returns workload callable for single MPC step with recompute."""
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    N = n_candidates
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
+            ctx_N = ctx_latents.expand(N, -1, -1, -1, -1)
+            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
+
+    return workload
+
+
+def make_workload_mpc_cached(model, ctx_latents, n_candidates, num_ode_steps, cache_type: str = "kv"):
+    """Factory: returns workload callable for single MPC step with shared context cache."""
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    N = n_candidates
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
+            _cached_rollout_step(model, ctx_latents, a_cond, n_ctx_tokens, num_ode_steps, dtype, cache_type=cache_type)
+
+    return workload
+
+
+def make_workload_ungraphed_euler_step(model, ctx_latents, n_candidates, num_ode_steps):
+    """Factory: returns workload callable for ungraphed Euler step."""
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    N = n_candidates
+    ctx_N = ctx_latents.expand(N, -1, -1, -1, -1)
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
+            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
+
+    return workload
+
+
+def make_workload_graphed_euler_step(solver, model, ctx_latents, n_candidates):
+    """Factory: returns workload callable for graphed Euler step replay.
+
+    Args:
+        solver: Pre-constructed GraphedEulerStep instance (capture done once).
+        model: DiT model.
+        ctx_latents: [1, n_ctx, C, H, W] context frames.
+        n_candidates: Batch size for candidates (N).
+    """
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    N = n_candidates
+
+    g = torch.Generator(device=device).manual_seed(1)
+    a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype, generator=g)
+    x_init = torch.randn(N, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
+
+    def workload():
+        solver.run(model, ctx_latents, a_cond, x_init=x_init)
+
+    return workload
+
+
+def make_workload_graphed_euler_bs1(solver, model, ctx_latents, ctx_actions, action):
+    """Factory: returns workload callable for graphed Euler BS=1 replay.
+
+    Args:
+        solver: Pre-constructed GraphedHeunSolver instance (capture done once).
+        model: DiT model.
+        ctx_latents: [1, n_ctx, C, H, W] context frames.
+        ctx_actions: [1, 4] context actions.
+        action: [1, 4] action for inference.
+    """
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+
+    g = torch.Generator(device=device).manual_seed(2)
+    x_init = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
+
+    def workload():
+        solver.run(model, ctx_latents, ctx_actions, action, x_init=x_init)
+
+    return workload
+
+
+def make_workload_slide_physical(model, ctx_latents, ctx_actions, n_roll_frames, n_frame_kvs):
+    """Factory: returns workload callable for physical sliding window cache.
+
+    Args:
+        model: DiT model.
+        ctx_latents: [1, n_ctx, C, H, W] context frames.
+        ctx_actions: [1, 4] context actions.
+        n_roll_frames: Number of frames to roll.
+        n_frame_kvs: Pre-computed [(k, v), ...] tensors for new frames.
+    """
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            cache = _make_cache(n_ctx_tokens, device, dtype)
+            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            for frame_idx in range(n_roll_frames):
+                k_new, v_new = n_frame_kvs[frame_idx]
+                for layer_idx in range(DEPTH):
+                    cache.slide(layer_idx, k_new, v_new)
+
+    return workload
+
+
+def make_workload_slide_ring(model, ctx_latents, ctx_actions, n_roll_frames, n_frame_kvs):
+    """Factory: returns workload callable for ring-buffer sliding window cache.
+
+    Args:
+        model: DiT model.
+        ctx_latents: [1, n_ctx, C, H, W] context frames.
+        ctx_actions: [1, 4] context actions.
+        n_roll_frames: Number of frames to roll.
+        n_frame_kvs: Pre-computed [(k, v), ...] tensors for new frames.
+    """
+    device = ctx_latents.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
+            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            for frame_idx in range(n_roll_frames):
+                k_new, v_new = n_frame_kvs[frame_idx]
+                for layer_idx in range(DEPTH):
+                    cache.slide_ring(layer_idx, k_new, v_new)
+                cache.advance_head()
+
+    return workload
+
+
+@torch.no_grad()
+def bench_euler_cached_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
+    """Euler (BS=1) with persistent cache (prefill once)."""
+    device = action.device
+    run = make_workload_euler_bs1_cached(model, ctx_latents, ctx_actions, action, num_steps)
 
     # Warmup
     for _ in range(warmup):
@@ -93,23 +285,8 @@ def bench_euler_cached_bs1(model, ctx_latents, ctx_actions, action, num_steps, w
 @torch.no_grad()
 def bench_euler_cached_bs1_ring(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
     """Euler (BS=1) with persistent ring-buffer cache (prefill once)."""
-    B = 1
     device = action.device
-    dtype = next(model.parameters()).dtype
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-    dt = 1.0 / num_steps
-    t_buf = torch.empty(B, device=device, dtype=dtype)
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
-            x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-            for i in range(num_steps):
-                t_buf.fill_(i * dt)
-                v = model(x, t_buf, action, cache=cache)
-                x.add_(v, alpha=dt)
-            return x
+    run = make_workload_euler_bs1_cached_ring(model, ctx_latents, ctx_actions, action, num_steps)
 
     # Warmup
     for _ in range(warmup):
@@ -134,22 +311,8 @@ def bench_euler_cached_bs1_ring(model, ctx_latents, ctx_actions, action, num_ste
 @torch.no_grad()
 def bench_euler_recompute_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
     """Euler (BS=1) with fresh cache per step (recompute baseline)."""
-    B = 1
     device = action.device
-    dtype = next(model.parameters()).dtype
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-    dt = 1.0 / num_steps
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            x = torch.randn(B, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-            for i in range(num_steps):
-                cache = _make_cache(n_ctx_tokens, device, dtype)
-                model.prefill_cache(ctx_latents, ctx_actions, cache)
-                t_val = torch.full((B,), i * dt, device=device, dtype=dtype)
-                v = model(x, t_val, action, cache=cache)
-                x = x + dt * v
-            return x
+    run = make_workload_euler_bs1_recompute(model, ctx_latents, ctx_actions, action, num_steps)
 
     for _ in range(warmup):
         run()
@@ -178,16 +341,7 @@ def bench_mpc_recompute(model, ctx_latents, ctx_actions, warmup, repeats,
     at every ODE step for every candidate via _euler_rollout_step.
     One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
     """
-    device = ctx_latents.device
-    dtype  = next(model.parameters()).dtype
-    N      = n_candidates
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            a_cond   = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
-            ctx_N    = ctx_latents.expand(N, -1, -1, -1, -1)
-            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
+    run = make_workload_mpc_recompute(model, ctx_latents, n_candidates, num_ode_steps)
 
     for _ in range(warmup):
         run()
@@ -237,15 +391,7 @@ def bench_mpc_cached(model, ctx_latents, ctx_actions, warmup, repeats,
     prefill once, SDPA broadcasts to all N candidates across all ODE steps.
     One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
     """
-    device = ctx_latents.device
-    dtype  = next(model.parameters()).dtype
-    N      = n_candidates
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
-            _cached_rollout_step(model, ctx_latents, a_cond, n_ctx_tokens, num_ode_steps, dtype, cache_type="kv")
+    run = make_workload_mpc_cached(model, ctx_latents, n_candidates, num_ode_steps, cache_type="kv")
 
     for _ in range(warmup):
         run()
@@ -273,15 +419,7 @@ def bench_mpc_cached_ring(model, ctx_latents, ctx_actions, warmup, repeats,
     prefill once, SDPA broadcasts to all N candidates across all ODE steps.
     One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
     """
-    device = ctx_latents.device
-    dtype  = next(model.parameters()).dtype
-    N      = n_candidates
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype)
-            _cached_rollout_step(model, ctx_latents, a_cond, n_ctx_tokens, num_ode_steps, dtype, cache_type="ring")
+    run = make_workload_mpc_cached(model, ctx_latents, n_candidates, num_ode_steps, cache_type="ring")
 
     for _ in range(warmup):
         run()
@@ -309,17 +447,12 @@ def bench_graphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
     n_ctx  = ctx_latents.shape[1]
     N      = n_candidates
 
+    # Construct solver once (capture is a one-time cost)
     solver = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
                                num_ode_steps=num_ode_steps,
                                cache_type=cache_type, dtype=dtype)
 
-    ctx_latents_1 = ctx_latents          # [1, n_ctx, C, H, W]
-    g = torch.Generator(device=device).manual_seed(1)
-    a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype, generator=g)
-    x_init = torch.randn(N, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
-
-    def run():
-        solver.run(model, ctx_latents_1, a_cond, x_init=x_init)
+    run = make_workload_graphed_euler_step(solver, model, ctx_latents, N)
 
     for _ in range(warmup):
         run()
@@ -355,17 +488,7 @@ def bench_graphed_euler_step_both(model, ctx_latents, ctx_actions, warmup, repea
 def bench_ungraphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
                                 n_candidates, num_ode_steps):
     """Ungraphed Euler step baseline (current _euler_rollout_step behaviour)."""
-    device = ctx_latents.device
-    dtype  = next(model.parameters()).dtype
-    N      = n_candidates
-    ctx_N  = ctx_latents.expand(N, -1, -1, -1, -1)
-
-    g = torch.Generator(device=device).manual_seed(1)
-    a_cond = torch.randn(N, ACTION_DIM, device=device, dtype=dtype, generator=g)
-
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            _euler_rollout_step(model, ctx_N, a_cond, num_ode_steps, dtype)
+    run = make_workload_ungraphed_euler_step(model, ctx_latents, n_candidates, num_ode_steps)
 
     for _ in range(warmup):
         run()
@@ -391,13 +514,10 @@ def bench_graphed_euler_bs1(model, ctx_latents, ctx_actions, action, warmup, rep
     dtype  = next(model.parameters()).dtype
     n_ctx  = ctx_latents.shape[1]
 
+    # Construct solver once (capture is a one-time cost)
     solver = GraphedHeunSolver(model, n_ctx=n_ctx, num_steps=num_steps, cache_type=cache_type, dtype=dtype)
 
-    g = torch.Generator(device=device).manual_seed(2)
-    x_init = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype, generator=g)
-
-    def run():
-        solver.run(model, ctx_latents, ctx_actions, action, x_init=x_init)
+    run = make_workload_graphed_euler_bs1(solver, model, ctx_latents, ctx_actions, action)
 
     for _ in range(warmup):
         run()
@@ -439,7 +559,6 @@ def bench_slide_physical(model, ctx_latents, ctx_actions, action, n_roll_frames,
     """
     device = action.device
     dtype  = next(model.parameters()).dtype
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
     n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
 
     # Pre-compute new-frame K/V (same for both benchmarks — eliminates noise)
@@ -452,14 +571,7 @@ def bench_slide_physical(model, ctx_latents, ctx_actions, action, n_roll_frames,
         for _ in range(n_roll_frames)
     ]
 
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            cache = _make_cache(n_ctx_tokens, device, dtype)
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
-            for frame_idx in range(n_roll_frames):
-                k_new, v_new = new_frame_kvs[frame_idx]
-                for layer_idx in range(DEPTH):
-                    cache.slide(layer_idx, k_new, v_new)
+    run = make_workload_slide_physical(model, ctx_latents, ctx_actions, n_roll_frames, new_frame_kvs)
 
     for _ in range(warmup):
         run()
@@ -487,7 +599,6 @@ def bench_slide_ring(model, ctx_latents, ctx_actions, action, n_roll_frames, war
     """
     device = action.device
     dtype  = next(model.parameters()).dtype
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
     n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
 
     g = torch.Generator(device=device).manual_seed(0)
@@ -499,19 +610,7 @@ def bench_slide_ring(model, ctx_latents, ctx_actions, action, n_roll_frames, war
         for _ in range(n_roll_frames)
     ]
 
-    def run():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            cache = RingKVCache(
-                DEPTH, NUM_HEADS, HEAD_DIM,
-                n_ctx_tokens, NUM_PATCHES, NUM_PATCHES,
-                device=device, dtype=dtype,
-            )
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
-            for frame_idx in range(n_roll_frames):
-                k_new, v_new = new_frame_kvs[frame_idx]
-                for layer_idx in range(DEPTH):
-                    cache.slide_ring(layer_idx, k_new, v_new)
-                cache.advance_head()
+    run = make_workload_slide_ring(model, ctx_latents, ctx_actions, n_roll_frames, new_frame_kvs)
 
     for _ in range(warmup):
         run()

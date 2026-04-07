@@ -32,7 +32,8 @@
       "Bash(pkill -f \"train_online\")",
       "Bash(echo \"PID: $!\")",
       "Bash(python -m py_compile models/cache.py inference/graph_solver.py)",
-      "Bash(python -m py_compile profiler/profile_colab.py)"
+      "Bash(python -m py_compile profiler/profile_colab.py)",
+      "Bash(python -m py_compile inference/bench.py)"
     ]
   },
   "outputStyle": "Explanatory"

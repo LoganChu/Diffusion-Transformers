@@ -1,4 +1,7 @@
-"""Comprehensive profiling script for DiT inference benchmarks.
+"""Comprehensive profiling script for DiT inference benchmarks via torch.profiler.
+
+Uses workload factories from inference/bench.py to ensure single source of truth
+for benchmark logic. Outputs TensorBoard-compatible .pt.trace.json files.
 
 Run in Google Colab with:
     !pip install torch-tb-profiler
@@ -6,7 +9,8 @@ Run in Google Colab with:
     %load_ext tensorboard
     %tensorboard --logdir /content/traces
 
-Outputs Chrome trace JSON and TensorBoard .pt.trace.json files to /content/traces/.
+Or locally:
+    python profiler/profile_colab.py
 """
 
 import sys
@@ -24,19 +28,29 @@ except ImportError:
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-CKPT_PATH  = os.path.join(REPO_ROOT, "offline_best.pt")
-TRACE_DIR  = "/content/traces"
+CKPT_PATH = os.path.join(REPO_ROOT, "offline_best.pt")
+TRACE_DIR = "/content/traces" if os.path.exists("/content") else "/tmp/traces"
 os.makedirs(TRACE_DIR, exist_ok=True)
 
 # --- Core imports ---
 import torch
-import torch.cuda.nvtx as nvtx
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
-from models.cache import KVCache, RingKVCache
 from models.dit import (
     ACTION_DIM, DEPTH, HEAD_DIM, IN_CHANNELS,
     LATENT_H, LATENT_W, NUM_HEADS, NUM_PATCHES, DiTSmall,
+)
+from inference.bench import (
+    make_workload_euler_bs1_cached,
+    make_workload_euler_bs1_cached_ring,
+    make_workload_euler_bs1_recompute,
+    make_workload_mpc_recompute,
+    make_workload_mpc_cached,
+    make_workload_ungraphed_euler_step,
+    make_workload_graphed_euler_step,
+    make_workload_graphed_euler_bs1,
+    make_workload_slide_physical,
+    make_workload_slide_ring,
 )
 from inference.graph_solver import GraphedEulerStep, GraphedHeunSolver
 
@@ -72,21 +86,6 @@ def make_inputs(n_ctx: int = 2, B: int = 1, N: int = 64,
     )
 
 
-def _make_cache(n_ctx_tokens: int, device, dtype, cache_type: str = "kv"):
-    """Factory for KVCache or RingKVCache."""
-    if cache_type == "ring":
-        return RingKVCache(
-            DEPTH, NUM_HEADS, HEAD_DIM,
-            n_ctx_tokens, NUM_PATCHES, NUM_PATCHES,
-            device=device, dtype=dtype,
-        )
-    return KVCache(
-        DEPTH, NUM_HEADS, HEAD_DIM,
-        n_ctx_tokens, NUM_PATCHES,
-        device=device, dtype=dtype,
-    )
-
-
 def run_profiler(label: str, workload_fn, n_steps: int = 7):
     """
     Run workload_fn under torch.profiler for n_steps calls.
@@ -97,8 +96,6 @@ def run_profiler(label: str, workload_fn, n_steps: int = 7):
         workload_fn: Callable with no arguments.
         n_steps: Total profiler steps (default 7 = skip_first + wait + warmup + active).
     """
-    trace_path = os.path.join(TRACE_DIR, f"{label}.json")
-
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=PROF_SCHEDULE,
@@ -120,51 +117,29 @@ def run_profiler(label: str, workload_fn, n_steps: int = 7):
         sort_by="cuda_time_total",
         row_limit=20,
     ))
-    print(f"Trace saved to: {trace_path}")
 
 
 # --- Benchmark 1: Euler BS=1 (KV / Ring / Recompute) ---
-def profile_euler_bs1(model, inputs, n_ctx_tokens, device, dtype,
-                       num_steps: int = 8):
+def profile_euler_bs1(model, inputs, num_steps: int = 8):
     """Profile Euler BS=1 with different cache types."""
-    dt = 1.0 / num_steps
-    t_buf = torch.empty(1, device=device, dtype=dtype)
     ctx = inputs["ctx_latents"]
     ctx_a = inputs["ctx_actions"]
     action = inputs["action"]
 
     def euler_kv():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.euler_bs1_kv"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                model.prefill_cache(ctx, ctx_a, cache)
-                x = inputs["x_init_bs1"].clone()
-                for i in range(num_steps):
-                    t_buf.fill_(i * dt)
-                    v = model(x, t_buf, action, cache=cache)
-                    x.add_(v, alpha=dt)
+        with record_function("bench.euler_bs1_kv"):
+            workload = make_workload_euler_bs1_cached(model, ctx, ctx_a, action, num_steps)
+            workload()
 
     def euler_ring():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.euler_bs1_ring"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "ring")
-                model.prefill_cache(ctx, ctx_a, cache)
-                x = inputs["x_init_bs1"].clone()
-                for i in range(num_steps):
-                    t_buf.fill_(i * dt)
-                    v = model(x, t_buf, action, cache=cache)
-                    x.add_(v, alpha=dt)
+        with record_function("bench.euler_bs1_ring"):
+            workload = make_workload_euler_bs1_cached_ring(model, ctx, ctx_a, action, num_steps)
+            workload()
 
     def euler_recompute():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.euler_bs1_recompute"):
-                x = inputs["x_init_bs1"].clone()
-                for i in range(num_steps):
-                    cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                    model.prefill_cache(ctx, ctx_a, cache)
-                    t_val = torch.full((1,), i * dt, device=device, dtype=dtype)
-                    v = model(x, t_val, action, cache=cache)
-                    x = x + dt * v
+        with record_function("bench.euler_bs1_recompute"):
+            workload = make_workload_euler_bs1_recompute(model, ctx, ctx_a, action, num_steps)
+            workload()
 
     run_profiler("euler_bs1_kv",        euler_kv)
     run_profiler("euler_bs1_ring",      euler_ring)
@@ -172,49 +147,24 @@ def profile_euler_bs1(model, inputs, n_ctx_tokens, device, dtype,
 
 
 # --- Benchmark 2: MPC step (KV / Ring / Recompute) ---
-def profile_mpc_step(model, inputs, n_ctx_tokens, device, dtype,
-                      N: int = 64, num_ode_steps: int = 4):
+def profile_mpc_step(model, inputs, N: int = 64, num_ode_steps: int = 4):
     """Profile MPC single step with different cache types."""
-    dt = 1.0 / num_ode_steps
     ctx = inputs["ctx_latents"]
-    ctx_a = inputs["ctx_actions"]
-    a_cond = inputs["a_cond_N"]
 
     def mpc_kv():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.mpc_kv"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                model.prefill_cache(ctx[0:1], a_cond[0:1], cache)
-                x = inputs["x_init_N"].clone()
-                t_buf = torch.empty(N, device=device, dtype=dtype)
-                for i in range(num_ode_steps):
-                    t_buf.fill_(i * dt)
-                    v = model(x, t_buf, a_cond, cache=cache)
-                    x.add_(v, alpha=dt)
+        with record_function("bench.mpc_kv"):
+            workload = make_workload_mpc_cached(model, ctx, N, num_ode_steps, cache_type="kv")
+            workload()
 
     def mpc_ring():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.mpc_ring"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "ring")
-                model.prefill_cache(ctx[0:1], a_cond[0:1], cache)
-                x = inputs["x_init_N"].clone()
-                t_buf = torch.empty(N, device=device, dtype=dtype)
-                for i in range(num_ode_steps):
-                    t_buf.fill_(i * dt)
-                    v = model(x, t_buf, a_cond, cache=cache)
-                    x.add_(v, alpha=dt)
+        with record_function("bench.mpc_ring"):
+            workload = make_workload_mpc_cached(model, ctx, N, num_ode_steps, cache_type="ring")
+            workload()
 
     def mpc_recompute():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.mpc_recompute"):
-                ctx_N = ctx.expand(N, -1, -1, -1, -1)
-                x = inputs["x_init_N"].clone()
-                for i in range(num_ode_steps):
-                    cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                    model.prefill_cache(ctx_N, a_cond, cache)
-                    t_val = torch.full((N,), i * dt, device=device, dtype=dtype)
-                    v = model(x, t_val, a_cond, cache=cache)
-                    x = x + dt * v
+        with record_function("bench.mpc_recompute"):
+            workload = make_workload_mpc_recompute(model, ctx, N, num_ode_steps)
+            workload()
 
     run_profiler("mpc_kv",        mpc_kv)
     run_profiler("mpc_ring",      mpc_ring)
@@ -222,12 +172,16 @@ def profile_mpc_step(model, inputs, n_ctx_tokens, device, dtype,
 
 
 # --- Benchmark 3: Slide (Physical vs Ring) ---
-def profile_slide(model, inputs, n_ctx_tokens, device, dtype,
-                   n_roll_frames: int = 8):
+def profile_slide(model, inputs, n_roll_frames: int = 8):
     """Profile KVCache.slide vs RingKVCache.slide_ring."""
     ctx = inputs["ctx_latents"]
     ctx_a = inputs["ctx_actions"]
+    action = inputs["action"]
+    device = ctx.device
+    dtype = next(model.parameters()).dtype
     n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
+
+    # Pre-compute new-frame K/V (same for both benchmarks — eliminates noise)
     g = torch.Generator(device=device).manual_seed(0)
     new_frame_kvs = [
         (
@@ -238,91 +192,70 @@ def profile_slide(model, inputs, n_ctx_tokens, device, dtype,
     ]
 
     def slide_physical():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.slide_physical"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                model.prefill_cache(ctx, ctx_a, cache)
-                for frame_idx in range(n_roll_frames):
-                    k_new, v_new = new_frame_kvs[frame_idx]
-                    for layer_idx in range(DEPTH):
-                        cache.slide(layer_idx, k_new, v_new)
+        with record_function("bench.slide_physical"):
+            workload = make_workload_slide_physical(model, ctx, ctx_a, n_roll_frames, new_frame_kvs)
+            workload()
 
     def slide_ring():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.slide_ring"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "ring")
-                model.prefill_cache(ctx, ctx_a, cache)
-                for frame_idx in range(n_roll_frames):
-                    k_new, v_new = new_frame_kvs[frame_idx]
-                    for layer_idx in range(DEPTH):
-                        cache.slide_ring(layer_idx, k_new, v_new)
-                    cache.advance_head()
+        with record_function("bench.slide_ring"):
+            workload = make_workload_slide_ring(model, ctx, ctx_a, n_roll_frames, new_frame_kvs)
+            workload()
 
     run_profiler("slide_physical", slide_physical)
     run_profiler("slide_ring",     slide_ring)
 
 
 # --- Benchmark 4: Graphed vs Eager ---
-def profile_graphed_vs_eager(model, inputs, n_ctx, device, dtype,
-                               N: int = 64, num_ode_steps: int = 4,
-                               num_steps_bs1: int = 8):
+def profile_graphed_vs_eager(model, inputs, n_ctx, N: int = 64, num_ode_steps: int = 4,
+                             num_steps_bs1: int = 8):
     """Profile CUDA graphed vs eager execution."""
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
     ctx = inputs["ctx_latents"]
     ctx_a = inputs["ctx_actions"]
     action = inputs["action"]
-    a_cond = inputs["a_cond_N"]
 
     # Construct solvers outside profiling (one-time capture cost)
     print("\nConstructing CUDA graphs (this may take 10-30 seconds)...")
     solver_euler_kv   = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
                                           num_ode_steps=num_ode_steps,
-                                          cache_type="kv",   dtype=dtype)
+                                          cache_type="kv", dtype=dtype)
     solver_euler_ring = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
                                           num_ode_steps=num_ode_steps,
                                           cache_type="ring", dtype=dtype)
     solver_heun_kv    = GraphedHeunSolver(model, n_ctx=n_ctx,
                                            num_steps=num_steps_bs1,
-                                           cache_type="kv",  dtype=dtype)
+                                           cache_type="kv", dtype=dtype)
     solver_heun_ring  = GraphedHeunSolver(model, n_ctx=n_ctx,
                                            num_steps=num_steps_bs1,
                                            cache_type="ring", dtype=dtype)
     print("Graphs constructed.")
 
     # Eager MPC (N candidates, KV-cached)
-    dt = 1.0 / num_ode_steps
-    n_ctx_tokens = n_ctx * NUM_PATCHES
-
     def eager_mpc_kv():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.eager_mpc_kv"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                model.prefill_cache(ctx[0:1], a_cond[0:1], cache)
-                x = inputs["x_init_N"].clone()
-                t_buf = torch.empty(N, device=device, dtype=dtype)
-                for i in range(num_ode_steps):
-                    t_buf.fill_(i * dt)
-                    v = model(x, t_buf, a_cond, cache=cache)
-                    x.add_(v, alpha=dt)
+        with record_function("bench.eager_mpc_kv"):
+            workload = make_workload_mpc_cached(model, ctx, N, num_ode_steps, cache_type="kv")
+            workload()
 
     def graphed_euler_kv():
         with record_function("bench.graphed_euler_kv"):
-            solver_euler_kv.run(model, ctx, a_cond,
-                                 x_init=inputs["x_init_N"])
+            workload = make_workload_graphed_euler_step(solver_euler_kv, model, ctx, N)
+            workload()
 
     def graphed_euler_ring():
         with record_function("bench.graphed_euler_ring"):
-            solver_euler_ring.run(model, ctx, a_cond,
-                                   x_init=inputs["x_init_N"])
+            workload = make_workload_graphed_euler_step(solver_euler_ring, model, ctx, N)
+            workload()
 
     def graphed_heun_kv():
         with record_function("bench.graphed_heun_kv"):
-            solver_heun_kv.run(model, ctx, ctx_a, action,
-                                x_init=inputs["x_init_bs1"])
+            workload = make_workload_graphed_euler_bs1(solver_heun_kv, model, ctx, ctx_a, action)
+            workload()
 
     def graphed_heun_ring():
         with record_function("bench.graphed_heun_ring"):
-            solver_heun_ring.run(model, ctx, ctx_a, action,
-                                  x_init=inputs["x_init_bs1"])
+            workload = make_workload_graphed_euler_bs1(solver_heun_ring, model, ctx, ctx_a, action)
+            workload()
 
     run_profiler("graphed_euler_kv",   graphed_euler_kv)
     run_profiler("graphed_euler_ring", graphed_euler_ring)
@@ -331,27 +264,17 @@ def profile_graphed_vs_eager(model, inputs, n_ctx, device, dtype,
     run_profiler("eager_mpc_kv",       eager_mpc_kv)
 
 
-# --- Benchmark 5: Prefill cost ---
-def profile_prefill(model, inputs, device, dtype):
-    """Profile context encoding (prefill) cost."""
+# --- Benchmark 5: Ungraphed Euler ---
+def profile_ungraphed(model, inputs, N: int = 64, num_ode_steps: int = 4):
+    """Profile ungraphed Euler step baseline."""
     ctx = inputs["ctx_latents"]
-    ctx_a = inputs["ctx_actions"]
-    n_ctx_tokens = ctx.shape[1] * NUM_PATCHES
 
-    def prefill_kv():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.prefill_kv"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "kv")
-                model.prefill_cache(ctx, ctx_a, cache)
+    def ungraphed_euler():
+        with record_function("bench.ungraphed_euler"):
+            workload = make_workload_ungraphed_euler_step(model, ctx, N, num_ode_steps)
+            workload()
 
-    def prefill_ring():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            with record_function("bench.prefill_ring"):
-                cache = _make_cache(n_ctx_tokens, device, dtype, "ring")
-                model.prefill_cache(ctx, ctx_a, cache)
-
-    run_profiler("prefill_kv",   prefill_kv)
-    run_profiler("prefill_ring", prefill_ring)
+    run_profiler("ungraphed_euler", ungraphed_euler)
 
 
 def main():
@@ -368,47 +291,42 @@ def main():
     model = load_model(CKPT_PATH, device)
     print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
-    n_ctx_tokens = N_CTX * NUM_PATCHES
     inputs = make_inputs(n_ctx=N_CTX, B=1, N=N, device=device, dtype=dtype)
 
     print("\n" + "="*70)
     print("  Benchmark 1: Euler BS=1 (KV / Ring / Recompute)")
     print("="*70)
-    profile_euler_bs1(model, inputs, n_ctx_tokens, device, dtype,
-                       num_steps=NUM_STEPS_BS1)
+    profile_euler_bs1(model, inputs, num_steps=NUM_STEPS_BS1)
 
     print("\n" + "="*70)
     print("  Benchmark 2: MPC Step (KV / Ring / Recompute)")
     print("="*70)
-    profile_mpc_step(model, inputs, n_ctx_tokens, device, dtype,
-                      N=N, num_ode_steps=NUM_ODE_STEPS)
+    profile_mpc_step(model, inputs, N=N, num_ode_steps=NUM_ODE_STEPS)
 
     print("\n" + "="*70)
     print("  Benchmark 3: Slide (Physical vs Ring)")
     print("="*70)
-    profile_slide(model, inputs, n_ctx_tokens, device, dtype,
-                   n_roll_frames=N_ROLL_FRAMES)
+    profile_slide(model, inputs, n_roll_frames=N_ROLL_FRAMES)
 
     print("\n" + "="*70)
     print("  Benchmark 4: Graphed vs Eager")
     print("="*70)
-    profile_graphed_vs_eager(model, inputs, N_CTX, device, dtype,
-                              N=N, num_ode_steps=NUM_ODE_STEPS,
-                              num_steps_bs1=NUM_STEPS_BS1)
+    profile_graphed_vs_eager(model, inputs, N_CTX, N=N, num_ode_steps=NUM_ODE_STEPS,
+                             num_steps_bs1=NUM_STEPS_BS1)
 
     print("\n" + "="*70)
-    print("  Benchmark 5: Prefill Cost")
+    print("  Benchmark 5: Ungraphed Euler (baseline)")
     print("="*70)
-    profile_prefill(model, inputs, device, dtype)
+    profile_ungraphed(model, inputs, N=N, num_ode_steps=NUM_ODE_STEPS)
 
     print("\n" + "="*70)
-    print("  PROFILING COMPLETE")
+    print(f"All traces written to: {TRACE_DIR}")
     print("="*70)
-    print(f"\nAll traces written to: {TRACE_DIR}")
-    print("\nIn Colab, view traces with TensorBoard:")
-    print("  %load_ext tensorboard")
+    print("\nTo download traces (Colab):")
+    print("  from google.colab import files")
+    print("  files.download('/content/traces')")
+    print("\nTo view in TensorBoard:")
     print("  %tensorboard --logdir /content/traces")
-    print("\nOr download individual JSON files from the Files panel (left sidebar).")
 
 
 if __name__ == "__main__":
