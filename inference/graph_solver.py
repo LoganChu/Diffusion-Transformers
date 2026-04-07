@@ -194,6 +194,7 @@ class GraphedHeunSolver:
         model:     DiTSmall in eval mode, float16 on CUDA.
         n_ctx:     Number of context frames.
         num_steps: Heun ODE steps (default 8 → 15 model evals).
+        cache_type: 'kv' for KVCache, 'ring' for RingKVCache.
         dtype:     Tensor dtype (default float16).
     """
 
@@ -202,6 +203,7 @@ class GraphedHeunSolver:
         model: torch.nn.Module,
         n_ctx: int,
         num_steps: int = 8,
+        cache_type: str = "kv",
         dtype: torch.dtype = torch.float16,
     ) -> None:
         device = next(model.parameters()).device
@@ -213,11 +215,18 @@ class GraphedHeunSolver:
         self.action = torch.empty(B, ACTION_DIM, device=device, dtype=dtype)
         self.t_buf  = torch.empty(B, device=device, dtype=dtype)
 
-        self.cache = KVCache(
-            DEPTH, NUM_HEADS, HEAD_DIM,
-            n_ctx_tokens, NUM_PATCHES,
-            device=device, dtype=dtype,
-        )
+        if cache_type == "ring":
+            self.cache: KVCache | RingKVCache = RingKVCache(
+                DEPTH, NUM_HEADS, HEAD_DIM,
+                n_ctx_tokens, NUM_PATCHES, NUM_PATCHES,
+                device=device, dtype=dtype,
+            )
+        else:
+            self.cache = KVCache(
+                DEPTH, NUM_HEADS, HEAD_DIM,
+                n_ctx_tokens, NUM_PATCHES,
+                device=device, dtype=dtype,
+            )
 
         self._dt        = 1.0 / num_steps
         self._num_steps = num_steps
