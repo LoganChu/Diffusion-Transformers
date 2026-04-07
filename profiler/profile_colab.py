@@ -16,7 +16,7 @@ import os
 try:
     from google.colab import drive
     drive.mount("/content/drive")
-    REPO_ROOT = "/content/drive/MyDrive/Diffusion-Transformers"  # Adjust to your actual path
+    REPO_ROOT = "/content/Diffusion-Transformers"  # Adjust to your actual path
 except ImportError:
     # Not in Colab — assume script is run from repo root directly
     REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
