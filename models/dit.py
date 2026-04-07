@@ -76,7 +76,7 @@ class TimestepEmbedder(nn.Module):
                 t_f32 = t.float().unsqueeze(1)  # [B, 1]
                 args = t_f32 * self.freqs.unsqueeze(0)  # [B, 128]
                 emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B, 256]
-            return self.mlp(emb)  # [B, 384]
+            return self.mlp(emb.to(self.mlp[0].weight.dtype))  # [B, 384]
 
 
 # ---------------------------------------------------------------------------
