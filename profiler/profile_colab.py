@@ -42,7 +42,6 @@ from models.dit import (
 )
 from inference.bench import (
     make_workload_euler_bs1_cached,
-    make_workload_euler_bs1_cached_ring,
     make_workload_euler_bs1_recompute,
     make_workload_mpc_recompute,
     make_workload_mpc_cached,
@@ -51,6 +50,8 @@ from inference.bench import (
     make_workload_graphed_euler_bs1,
     make_workload_slide_physical,
     make_workload_slide_ring,
+    make_workload_rolling_inference_physical,
+    make_workload_rolling_inference_ring,
 )
 from inference.graph_solver import GraphedEulerStep, GraphedHeunSolver
 
@@ -119,7 +120,7 @@ def run_profiler(label: str, workload_fn, n_steps: int = 7):
     ))
 
 
-# --- Benchmark 1: Euler BS=1 (KV / Ring / Recompute) ---
+# --- Benchmark 1: Euler BS=1 (KV / Recompute) ---
 def profile_euler_bs1(model, inputs, num_steps: int = 8):
     """Profile Euler BS=1 with different cache types."""
     ctx = inputs["ctx_latents"]
@@ -131,22 +132,16 @@ def profile_euler_bs1(model, inputs, num_steps: int = 8):
             workload = make_workload_euler_bs1_cached(model, ctx, ctx_a, action, num_steps)
             workload()
 
-    def euler_ring():
-        with record_function("bench.euler_bs1_ring"):
-            workload = make_workload_euler_bs1_cached_ring(model, ctx, ctx_a, action, num_steps)
-            workload()
-
     def euler_recompute():
         with record_function("bench.euler_bs1_recompute"):
             workload = make_workload_euler_bs1_recompute(model, ctx, ctx_a, action, num_steps)
             workload()
 
     run_profiler("euler_bs1_kv",        euler_kv)
-    run_profiler("euler_bs1_ring",      euler_ring)
     run_profiler("euler_bs1_recompute", euler_recompute)
 
 
-# --- Benchmark 2: MPC step (KV / Ring / Recompute) ---
+# --- Benchmark 2: MPC step (KV / Recompute) ---
 def profile_mpc_step(model, inputs, N: int = 64, num_ode_steps: int = 4):
     """Profile MPC single step with different cache types."""
     ctx = inputs["ctx_latents"]
@@ -156,18 +151,12 @@ def profile_mpc_step(model, inputs, N: int = 64, num_ode_steps: int = 4):
             workload = make_workload_mpc_cached(model, ctx, N, num_ode_steps, cache_type="kv")
             workload()
 
-    def mpc_ring():
-        with record_function("bench.mpc_ring"):
-            workload = make_workload_mpc_cached(model, ctx, N, num_ode_steps, cache_type="ring")
-            workload()
-
     def mpc_recompute():
         with record_function("bench.mpc_recompute"):
             workload = make_workload_mpc_recompute(model, ctx, N, num_ode_steps)
             workload()
 
     run_profiler("mpc_kv",        mpc_kv)
-    run_profiler("mpc_ring",      mpc_ring)
     run_profiler("mpc_recompute", mpc_recompute)
 
 
@@ -205,6 +194,43 @@ def profile_slide(model, inputs, n_roll_frames: int = 8):
     run_profiler("slide_ring",     slide_ring)
 
 
+# --- Benchmark 3b: Rolling Inference (Slide + ODE per frame) ---
+def profile_rolling_inference(model, inputs, n_roll_frames: int = 8, num_ode_steps: int = 4):
+    """Profile rolling inference: slide context + ODE solve per frame."""
+    ctx = inputs["ctx_latents"]
+    ctx_a = inputs["ctx_actions"]
+    action = inputs["action"]
+    device = ctx.device
+    dtype = next(model.parameters()).dtype
+    n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
+
+    g = torch.Generator(device=device).manual_seed(0)
+    new_frame_kvs = [
+        (
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+        )
+        for _ in range(n_roll_frames)
+    ]
+
+    def rolling_physical():
+        with record_function("bench.rolling_physical"):
+            workload = make_workload_rolling_inference_physical(
+                model, ctx, ctx_a, action, n_roll_frames, new_frame_kvs, num_ode_steps
+            )
+            workload()
+
+    def rolling_ring():
+        with record_function("bench.rolling_ring"):
+            workload = make_workload_rolling_inference_ring(
+                model, ctx, ctx_a, action, n_roll_frames, new_frame_kvs, num_ode_steps
+            )
+            workload()
+
+    run_profiler("rolling_physical", rolling_physical)
+    run_profiler("rolling_ring",     rolling_ring)
+
+
 # --- Benchmark 4: Graphed vs Eager ---
 def profile_graphed_vs_eager(model, inputs, n_ctx, N: int = 64, num_ode_steps: int = 4,
                              num_steps_bs1: int = 8):
@@ -220,15 +246,9 @@ def profile_graphed_vs_eager(model, inputs, n_ctx, N: int = 64, num_ode_steps: i
     solver_euler_kv   = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
                                           num_ode_steps=num_ode_steps,
                                           cache_type="kv", dtype=dtype)
-    solver_euler_ring = GraphedEulerStep(model, n_ctx=n_ctx, N=N,
-                                          num_ode_steps=num_ode_steps,
-                                          cache_type="ring", dtype=dtype)
     solver_heun_kv    = GraphedHeunSolver(model, n_ctx=n_ctx,
                                            num_steps=num_steps_bs1,
                                            cache_type="kv", dtype=dtype)
-    solver_heun_ring  = GraphedHeunSolver(model, n_ctx=n_ctx,
-                                           num_steps=num_steps_bs1,
-                                           cache_type="ring", dtype=dtype)
     print("Graphs constructed.")
 
     # Eager MPC (N candidates, KV-cached)
@@ -242,25 +262,13 @@ def profile_graphed_vs_eager(model, inputs, n_ctx, N: int = 64, num_ode_steps: i
             workload = make_workload_graphed_euler_step(solver_euler_kv, model, ctx, N)
             workload()
 
-    def graphed_euler_ring():
-        with record_function("bench.graphed_euler_ring"):
-            workload = make_workload_graphed_euler_step(solver_euler_ring, model, ctx, N)
-            workload()
-
     def graphed_heun_kv():
         with record_function("bench.graphed_heun_kv"):
             workload = make_workload_graphed_euler_bs1(solver_heun_kv, model, ctx, ctx_a, action)
             workload()
 
-    def graphed_heun_ring():
-        with record_function("bench.graphed_heun_ring"):
-            workload = make_workload_graphed_euler_bs1(solver_heun_ring, model, ctx, ctx_a, action)
-            workload()
-
     run_profiler("graphed_euler_kv",   graphed_euler_kv)
-    run_profiler("graphed_euler_ring", graphed_euler_ring)
     run_profiler("graphed_heun_kv",    graphed_heun_kv)
-    run_profiler("graphed_heun_ring",  graphed_heun_ring)
     run_profiler("eager_mpc_kv",       eager_mpc_kv)
 
 
@@ -294,28 +302,39 @@ def main():
     inputs = make_inputs(n_ctx=N_CTX, B=1, N=N, device=device, dtype=dtype)
 
     print("\n" + "="*70)
-    print("  Benchmark 1: Euler BS=1 (KV / Ring / Recompute)")
+    print("  Benchmark 1: Euler BS=1 (8 steps)")
     print("="*70)
     profile_euler_bs1(model, inputs, num_steps=NUM_STEPS_BS1)
 
     print("\n" + "="*70)
-    print("  Benchmark 2: MPC Step (KV / Ring / Recompute)")
+    print("  Benchmark 1b: Euler BS=1 (4 steps — matches MPC ODE steps)")
+    print("="*70)
+    profile_euler_bs1(model, inputs, num_steps=NUM_ODE_STEPS)
+
+    print("\n" + "="*70)
+    print("  Benchmark 2: MPC Step")
     print("="*70)
     profile_mpc_step(model, inputs, N=N, num_ode_steps=NUM_ODE_STEPS)
 
     print("\n" + "="*70)
-    print("  Benchmark 3: Slide (Physical vs Ring)")
+    print("  Benchmark 3: Rolling Context Slide (Physical vs Ring)")
     print("="*70)
     profile_slide(model, inputs, n_roll_frames=N_ROLL_FRAMES)
 
     print("\n" + "="*70)
-    print("  Benchmark 4: Graphed vs Eager")
+    print("  Benchmark 3b: Rolling Inference (Slide + ODE per frame)")
+    print("="*70)
+    profile_rolling_inference(model, inputs, n_roll_frames=N_ROLL_FRAMES,
+                              num_ode_steps=NUM_ODE_STEPS)
+
+    print("\n" + "="*70)
+    print("  Benchmark 4: CUDA Graph vs Eager")
     print("="*70)
     profile_graphed_vs_eager(model, inputs, N_CTX, N=N, num_ode_steps=NUM_ODE_STEPS,
                              num_steps_bs1=NUM_STEPS_BS1)
 
     print("\n" + "="*70)
-    print("  Benchmark 5: Ungraphed Euler (baseline)")
+    print("  Benchmark 5: Ungraphed Euler Baseline")
     print("="*70)
     profile_ungraphed(model, inputs, N=N, num_ode_steps=NUM_ODE_STEPS)
 

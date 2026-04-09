@@ -72,27 +72,6 @@ def make_workload_euler_bs1_cached(model, ctx_latents, ctx_actions, action, num_
     return workload
 
 
-def make_workload_euler_bs1_cached_ring(model, ctx_latents, ctx_actions, action, num_steps):
-    """Factory: returns workload callable for Euler BS=1 with ring-buffer cache."""
-    device = action.device
-    dtype = next(model.parameters()).dtype
-    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
-    dt = 1.0 / num_steps
-    t_buf = torch.empty(1, device=device, dtype=dtype)
-
-    def workload():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
-            x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
-            for i in range(num_steps):
-                t_buf.fill_(i * dt)
-                v = model(x, t_buf, action, cache=cache)
-                x.add_(v, alpha=dt)
-
-    return workload
-
-
 def make_workload_euler_bs1_recompute(model, ctx_latents, ctx_actions, action, num_steps):
     """Factory: returns workload callable for Euler BS=1 with recompute baseline."""
     device = action.device
@@ -256,37 +235,74 @@ def make_workload_slide_ring(model, ctx_latents, ctx_actions, n_roll_frames, n_f
     return workload
 
 
+def make_workload_rolling_inference_physical(
+    model, ctx_latents, ctx_actions, action, n_roll_frames, n_frame_kvs, num_ode_steps
+):
+    """Factory: rolling inference with physical-shift KV cache.
+
+    Per frame: slide context window O(n_ctx) via KVCache.slide, then run
+    a full num_ode_steps ODE solve with the updated cache.
+    """
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+    dt = 1.0 / num_ode_steps
+    t_buf = torch.empty(1, device=device, dtype=dtype)
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            cache = _make_cache(n_ctx_tokens, device, dtype)
+            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            for frame_idx in range(n_roll_frames):
+                k_new, v_new = n_frame_kvs[frame_idx]
+                for layer_idx in range(DEPTH):
+                    cache.slide(layer_idx, k_new, v_new)
+                x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
+                for i in range(num_ode_steps):
+                    t_buf.fill_(i * dt)
+                    v = model(x, t_buf, action, cache=cache)
+                    x.add_(v, alpha=dt)
+
+    return workload
+
+
+def make_workload_rolling_inference_ring(
+    model, ctx_latents, ctx_actions, action, n_roll_frames, n_frame_kvs, num_ode_steps
+):
+    """Factory: rolling inference with ring-buffer KV cache.
+
+    Per frame: slide context window O(n_frame) via RingKVCache.slide_ring +
+    advance_head, then run a full num_ode_steps ODE solve with the updated cache.
+    """
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_ctx_tokens = ctx_latents.shape[1] * NUM_PATCHES
+    dt = 1.0 / num_ode_steps
+    t_buf = torch.empty(1, device=device, dtype=dtype)
+
+    def workload():
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
+            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            for frame_idx in range(n_roll_frames):
+                k_new, v_new = n_frame_kvs[frame_idx]
+                for layer_idx in range(DEPTH):
+                    cache.slide_ring(layer_idx, k_new, v_new)
+                cache.advance_head()
+                x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
+                for i in range(num_ode_steps):
+                    t_buf.fill_(i * dt)
+                    v = model(x, t_buf, action, cache=cache)
+                    x.add_(v, alpha=dt)
+
+    return workload
+
+
 @torch.no_grad()
 def bench_euler_cached_bs1(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
     """Euler (BS=1) with persistent cache (prefill once)."""
     device = action.device
     run = make_workload_euler_bs1_cached(model, ctx_latents, ctx_actions, action, num_steps)
-
-    # Warmup
-    for _ in range(warmup):
-        run()
-    torch.cuda.synchronize()
-
-    # Timed
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    elapsed = []
-    for _ in range(repeats):
-        start.record()
-        run()
-        end.record()
-        torch.cuda.synchronize()
-        elapsed.append(start.elapsed_time(end))
-
-    return elapsed
-
-
-@torch.no_grad()
-def bench_euler_cached_bs1_ring(model, ctx_latents, ctx_actions, action, num_steps, warmup, repeats):
-    """Euler (BS=1) with persistent ring-buffer cache (prefill once)."""
-    device = action.device
-    run = make_workload_euler_bs1_cached_ring(model, ctx_latents, ctx_actions, action, num_steps)
 
     # Warmup
     for _ in range(warmup):
@@ -411,15 +427,73 @@ def bench_mpc_cached(model, ctx_latents, ctx_actions, warmup, repeats,
 
 
 @torch.no_grad()
-def bench_mpc_cached_ring(model, ctx_latents, ctx_actions, warmup, repeats,
-                          n_candidates, num_ode_steps):
-    """Single MPC step — Ring-buffer cached (context prefilled once, broadcast to N candidates).
+def bench_rolling_inference_physical(
+    model, ctx_latents, ctx_actions, action, n_roll_frames, num_ode_steps, warmup, repeats
+):
+    """Rolling inference with physical-shift KV cache.
 
-    Times one rollout of N candidates with shared BS=1 ring-buffer context cache:
-    prefill once, SDPA broadcasts to all N candidates across all ODE steps.
-    One MPC step is the atomic unit — the speedup ratio is the same at every horizon step.
+    Per frame: KVCache.slide (O(n_ctx)) + num_ode_steps model evals.
+    Tests the full pipeline cost of streaming inference.
     """
-    run = make_workload_mpc_cached(model, ctx_latents, n_candidates, num_ode_steps, cache_type="ring")
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
+
+    g = torch.Generator(device=device).manual_seed(0)
+    new_frame_kvs = [
+        (
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+        )
+        for _ in range(n_roll_frames)
+    ]
+
+    run = make_workload_rolling_inference_physical(
+        model, ctx_latents, ctx_actions, action, n_roll_frames, new_frame_kvs, num_ode_steps
+    )
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    elapsed = []
+    for _ in range(repeats):
+        start.record()
+        run()
+        end.record()
+        torch.cuda.synchronize()
+        elapsed.append(start.elapsed_time(end))
+
+    return elapsed
+
+
+@torch.no_grad()
+def bench_rolling_inference_ring(
+    model, ctx_latents, ctx_actions, action, n_roll_frames, num_ode_steps, warmup, repeats
+):
+    """Rolling inference with ring-buffer KV cache.
+
+    Per frame: RingKVCache.slide_ring (O(n_frame)) + num_ode_steps model evals.
+    Identical workload to bench_rolling_inference_physical — only the slide differs.
+    """
+    device = action.device
+    dtype = next(model.parameters()).dtype
+    n_frame_shape = (1, NUM_HEADS, NUM_PATCHES, HEAD_DIM)
+
+    g = torch.Generator(device=device).manual_seed(0)
+    new_frame_kvs = [
+        (
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+            torch.randn(*n_frame_shape, device=device, dtype=dtype, generator=g),
+        )
+        for _ in range(n_roll_frames)
+    ]
+
+    run = make_workload_rolling_inference_ring(
+        model, ctx_latents, ctx_actions, action, n_roll_frames, new_frame_kvs, num_ode_steps
+    )
 
     for _ in range(warmup):
         run()
@@ -471,17 +545,6 @@ def bench_graphed_euler_step(model, ctx_latents, ctx_actions, warmup, repeats,
     return elapsed
 
 
-@torch.no_grad()
-def bench_graphed_euler_step_both(model, ctx_latents, ctx_actions, warmup, repeats,
-                                   n_candidates, num_ode_steps):
-    """Benchmark graphed Euler step for both KV and ring-buffer cache types."""
-    results = {}
-    for cache_type in ["kv", "ring"]:
-        results[cache_type] = bench_graphed_euler_step(
-            model, ctx_latents, ctx_actions, warmup, repeats,
-            n_candidates, num_ode_steps, cache_type=cache_type
-        )
-    return results
 
 
 @torch.no_grad()
@@ -536,16 +599,6 @@ def bench_graphed_euler_bs1(model, ctx_latents, ctx_actions, action, warmup, rep
     return elapsed
 
 
-@torch.no_grad()
-def bench_graphed_euler_bs1_both(model, ctx_latents, ctx_actions, action, warmup, repeats, num_steps):
-    """Benchmark graphed Euler BS=1 for both KV and ring-buffer cache types."""
-    results = {}
-    for cache_type in ["kv", "ring"]:
-        results[cache_type] = bench_graphed_euler_bs1(
-            model, ctx_latents, ctx_actions, action, warmup, repeats,
-            num_steps, cache_type=cache_type
-        )
-    return results
 
 
 @torch.no_grad()
@@ -661,12 +714,8 @@ def main():
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     print()
 
-    # --- Euler BS=1 benchmarks ---
+    # --- Euler BS=1 benchmarks (8 steps) ---
     times_euler_cached = bench_euler_cached_bs1(
-        model, ctx_latents, ctx_actions, action,
-        args.num_steps, args.warmup, args.repeats,
-    )
-    times_euler_cached_ring = bench_euler_cached_bs1_ring(
         model, ctx_latents, ctx_actions, action,
         args.num_steps, args.warmup, args.repeats,
     )
@@ -677,10 +726,23 @@ def main():
 
     n_euler_evals_bs1    = args.num_steps
     mean_euler_cached    = sum(times_euler_cached)    / len(times_euler_cached)
-    mean_euler_cached_ring = sum(times_euler_cached_ring) / len(times_euler_cached_ring)
     mean_euler_recompute = sum(times_euler_recompute) / len(times_euler_recompute)
     euler_bs1_speedup    = mean_euler_recompute / mean_euler_cached
-    euler_bs1_kv_vs_ring = mean_euler_cached_ring / mean_euler_cached
+
+    # --- Euler BS=1 benchmarks (4 steps) ---
+    times_euler_cached_4 = bench_euler_cached_bs1(
+        model, ctx_latents, ctx_actions, action,
+        args.cem_ode_steps, args.warmup, args.repeats,
+    )
+    times_euler_recompute_4 = bench_euler_recompute_bs1(
+        model, ctx_latents, ctx_actions, action,
+        args.cem_ode_steps, args.warmup, args.repeats,
+    )
+
+    n_euler_evals_4      = args.cem_ode_steps
+    mean_euler_cached_4  = sum(times_euler_cached_4)  / len(times_euler_cached_4)
+    mean_euler_recompute_4 = sum(times_euler_recompute_4) / len(times_euler_recompute_4)
+    euler_4_speedup      = mean_euler_recompute_4 / mean_euler_cached_4
 
     # --- Single MPC step benchmarks ---
     times_mpc_recompute = bench_mpc_recompute(
@@ -695,77 +757,79 @@ def main():
         n_candidates=args.n_candidates,
         num_ode_steps=args.cem_ode_steps,
     )
-    times_mpc_cached_ring = bench_mpc_cached_ring(
-        model, ctx_latents, ctx_actions,
-        args.warmup, args.repeats,
-        n_candidates=args.n_candidates,
-        num_ode_steps=args.cem_ode_steps,
-    )
 
     n_mpc_evals        = args.cem_ode_steps
     mean_mpc_recompute = sum(times_mpc_recompute) / len(times_mpc_recompute)
     mean_mpc_cached    = sum(times_mpc_cached)    / len(times_mpc_cached)
-    mean_mpc_cached_ring = sum(times_mpc_cached_ring) / len(times_mpc_cached_ring)
     mpc_speedup        = mean_mpc_recompute / mean_mpc_cached
-    mpc_kv_vs_ring     = mean_mpc_cached_ring / mean_mpc_cached
 
     W = 75
     print("=" * W)
     print(f"  Single Inference Step  (Euler, BS=1, {n_euler_evals_bs1} evals)")
-    print(f"{'Metric':<35} {'KV Cache':>12} {'Ring Cache':>12} {'Recompute':>12}")
+    print(f"{'Metric':<35} {'KV Cache':>12} {'Recompute':>12}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_euler_cached:>12.2f} {mean_euler_cached_ring:>12.2f} {mean_euler_recompute:>12.2f}")
-    print(f"{'ms/step':<35} {mean_euler_cached/args.num_steps:>12.2f} {mean_euler_cached_ring/args.num_steps:>12.2f} {mean_euler_recompute/args.num_steps:>12.2f}")
-    print(f"{'ms/model_eval':<35} {mean_euler_cached/n_euler_evals_bs1:>12.2f} {mean_euler_cached_ring/n_euler_evals_bs1:>12.2f} {mean_euler_recompute/n_euler_evals_bs1:>12.2f}")
-    print(f"{'Speedup vs recompute':<35} {euler_bs1_speedup:>12.2f}x {mean_euler_recompute/mean_euler_cached_ring:>12.2f}x")
-    print(f"{'Ring/KV ratio':<35} {euler_bs1_kv_vs_ring:>12.2f}x")
+    print(f"{'Total (ms)':<35} {mean_euler_cached:>12.2f} {mean_euler_recompute:>12.2f}")
+    print(f"{'ms/step':<35} {mean_euler_cached/args.num_steps:>12.2f} {mean_euler_recompute/args.num_steps:>12.2f}")
+    print(f"{'ms/model_eval':<35} {mean_euler_cached/n_euler_evals_bs1:>12.2f} {mean_euler_recompute/n_euler_evals_bs1:>12.2f}")
+    print(f"{'Speedup vs recompute':<35} {euler_bs1_speedup:>12.2f}x")
     print("=" * W)
-    print(f"  Single MPC Step  (N={args.n_candidates}, {n_mpc_evals} evals @ BS={args.n_candidates})")
-    print(f"{'Metric':<35} {'KV Cache':>12} {'Ring Cache':>12} {'Recompute':>12}")
+
+    print(f"  Single Inference Step  (Euler, BS=1, {n_euler_evals_4} evals)")
+    print(f"{'Metric':<35} {'KV Cache':>12} {'Recompute':>12}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_mpc_cached:>12.2f} {mean_mpc_cached_ring:>12.2f} {mean_mpc_recompute:>12.2f}")
+    print(f"{'Total (ms)':<35} {mean_euler_cached_4:>12.2f} {mean_euler_recompute_4:>12.2f}")
+    print(f"{'ms/step':<35} {mean_euler_cached_4/args.cem_ode_steps:>12.2f} {mean_euler_recompute_4/args.cem_ode_steps:>12.2f}")
+    print(f"{'ms/model_eval':<35} {mean_euler_cached_4/n_euler_evals_4:>12.2f} {mean_euler_recompute_4/n_euler_evals_4:>12.2f}")
+    print(f"{'Speedup vs recompute':<35} {euler_4_speedup:>12.2f}x")
+    print("=" * W)
+
+    print(f"  Single MPC Step  (N={args.n_candidates}, {n_mpc_evals} evals @ BS={args.n_candidates})")
+    print(f"{'Metric':<35} {'KV Cache':>12} {'Recompute':>12}")
+    print("-" * W)
+    print(f"{'Total (ms)':<35} {mean_mpc_cached:>12.2f} {mean_mpc_recompute:>12.2f}")
     print(f"{'ms/model_eval (@ BS={:d})'.format(args.n_candidates):<35} "
-          f"{mean_mpc_cached/n_mpc_evals:>12.2f} {mean_mpc_cached_ring/n_mpc_evals:>12.2f} {mean_mpc_recompute/n_mpc_evals:>12.2f}")
-    print(f"{'Speedup vs recompute':<35} {mpc_speedup:>12.2f}x {mean_mpc_recompute/mean_mpc_cached_ring:>12.2f}x")
-    print(f"{'Ring/KV ratio':<35} {mpc_kv_vs_ring:>12.2f}x")
+          f"{mean_mpc_cached/n_mpc_evals:>12.2f} {mean_mpc_recompute/n_mpc_evals:>12.2f}")
+    print(f"{'Speedup vs recompute':<35} {mpc_speedup:>12.2f}x")
     print("=" * W)
 
     # Markdown block for results.md
     print("\n--- Markdown (copy to results.md) ---\n")
-    print("### Euler Solver (BS=1)")
+    print("### Euler Solver (BS=1, 8 steps)")
     print(f"| Solver | Total (ms) | ms/step | ms/eval | Speedup vs recompute |")
     print(f"|--------|-----------|---------|---------|------------|")
     print(f"| Euler (KV-cached)  | {mean_euler_cached:.2f} | "
           f"{mean_euler_cached/args.num_steps:.2f} | "
           f"{mean_euler_cached/n_euler_evals_bs1:.2f} | **{euler_bs1_speedup:.2f}x** |")
-    print(f"| Euler (Ring-cached)  | {mean_euler_cached_ring:.2f} | "
-          f"{mean_euler_cached_ring/args.num_steps:.2f} | "
-          f"{mean_euler_cached_ring/n_euler_evals_bs1:.2f} | **{mean_euler_recompute/mean_euler_cached_ring:.2f}x** |")
     print(f"| Euler (recompute)  | {mean_euler_recompute:.2f} | "
           f"{mean_euler_recompute/args.num_steps:.2f} | "
           f"{mean_euler_recompute/n_euler_evals_bs1:.2f} | 1.00x |")
-    print(f"| **KV/Ring ratio** | **{euler_bs1_kv_vs_ring:.2f}x** | | | |")
+    print()
+    print("### Euler Solver (BS=1, 4 steps)")
+    print(f"| Solver | Total (ms) | ms/step | ms/eval | Speedup vs recompute |")
+    print(f"|--------|-----------|---------|---------|------------|")
+    print(f"| Euler (KV-cached)  | {mean_euler_cached_4:.2f} | "
+          f"{mean_euler_cached_4/args.cem_ode_steps:.2f} | "
+          f"{mean_euler_cached_4/n_euler_evals_4:.2f} | **{euler_4_speedup:.2f}x** |")
+    print(f"| Euler (recompute)  | {mean_euler_recompute_4:.2f} | "
+          f"{mean_euler_recompute_4/args.cem_ode_steps:.2f} | "
+          f"{mean_euler_recompute_4/n_euler_evals_4:.2f} | 1.00x |")
     print()
     print(f"### Single MPC Step (N={args.n_candidates}, ode={args.cem_ode_steps})")
     print(f"| Planner | Total (ms) | ms/eval | Speedup vs recompute |")
     print(f"|---------|-----------|---------|------------|")
     print(f"| MPC (KV-cached)    | {mean_mpc_cached:.2f} | "
           f"{mean_mpc_cached/n_mpc_evals:.2f} | **{mpc_speedup:.2f}x** |")
-    print(f"| MPC (Ring-cached)    | {mean_mpc_cached_ring:.2f} | "
-          f"{mean_mpc_cached_ring/n_mpc_evals:.2f} | **{mean_mpc_recompute/mean_mpc_cached_ring:.2f}x** |")
     print(f"| MPC (recompute)    | {mean_mpc_recompute:.2f} | "
           f"{mean_mpc_recompute/n_mpc_evals:.2f} | 1.00x |")
-    print(f"| **KV/Ring ratio** | **{mpc_kv_vs_ring:.2f}x** | | |")
 
     # --- CUDA graph benchmarks ---
-    graphed_euler_results = bench_graphed_euler_step_both(
+    times_graphed_euler_kv = bench_graphed_euler_step(
         model, ctx_latents, ctx_actions,
         args.warmup, args.repeats,
         n_candidates=args.n_candidates,
         num_ode_steps=args.cem_ode_steps,
+        cache_type="kv",
     )
-    times_graphed_euler_kv = graphed_euler_results["kv"]
-    times_graphed_euler_ring = graphed_euler_results["ring"]
 
     times_ungraphed_euler = bench_ungraphed_euler_step(
         model, ctx_latents, ctx_actions,
@@ -774,45 +838,36 @@ def main():
         num_ode_steps=args.cem_ode_steps,
     )
 
-    graphed_euler_bs1_results = bench_graphed_euler_bs1_both(
+    times_graphed_euler_bs1_kv = bench_graphed_euler_bs1(
         model, ctx_latents, ctx_actions, action,
         args.warmup, args.repeats,
         num_steps=args.num_steps,
+        cache_type="kv",
     )
-    times_graphed_euler_bs1_kv = graphed_euler_bs1_results["kv"]
-    times_graphed_euler_bs1_ring = graphed_euler_bs1_results["ring"]
 
     mean_graphed_euler_kv   = sum(times_graphed_euler_kv)      / len(times_graphed_euler_kv)
-    mean_graphed_euler_ring = sum(times_graphed_euler_ring)    / len(times_graphed_euler_ring)
     mean_ungraphed_euler_N   = sum(times_ungraphed_euler)    / len(times_ungraphed_euler)
     mean_graphed_euler_bs1_kv   = sum(times_graphed_euler_bs1_kv)  / len(times_graphed_euler_bs1_kv)
-    mean_graphed_euler_bs1_ring = sum(times_graphed_euler_bs1_ring) / len(times_graphed_euler_bs1_ring)
     euler_N_graph_speedup_kv    = mean_ungraphed_euler_N / mean_graphed_euler_kv
-    euler_N_graph_speedup_ring  = mean_ungraphed_euler_N / mean_graphed_euler_ring
     euler_bs1_graph_speedup_kv  = mean_euler_cached      / mean_graphed_euler_bs1_kv
-    euler_bs1_graph_speedup_ring = mean_euler_cached_ring / mean_graphed_euler_bs1_ring
-    graphed_euler_n_kv_vs_ring = mean_graphed_euler_ring / mean_graphed_euler_kv
-    graphed_euler_bs1_kv_vs_ring = mean_graphed_euler_bs1_ring / mean_graphed_euler_bs1_kv
 
     n_euler_evals_N = args.cem_ode_steps
 
     print()
     print("=" * W)
     print(f"  CUDA Graph vs Eager  (Euler step, N={args.n_candidates}, ode={args.cem_ode_steps})")
-    print(f"{'Metric':<35} {'Graph KV':>12} {'Graph Ring':>12} {'Eager':>12}")
+    print(f"{'Metric':<35} {'Graph KV':>12} {'Eager':>12}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_graphed_euler_kv:>12.2f} {mean_graphed_euler_ring:>12.2f} {mean_ungraphed_euler_N:>12.2f}")
-    print(f"{'ms/model_eval':<35} {mean_graphed_euler_kv/n_euler_evals_N:>12.2f} {mean_graphed_euler_ring/n_euler_evals_N:>12.2f} {mean_ungraphed_euler_N/n_euler_evals_N:>12.2f}")
-    print(f"{'Speedup vs eager':<35} {euler_N_graph_speedup_kv:>12.2f}x {euler_N_graph_speedup_ring:>12.2f}x")
-    print(f"{'Ring/KV ratio':<35} {graphed_euler_n_kv_vs_ring:>12.2f}x")
+    print(f"{'Total (ms)':<35} {mean_graphed_euler_kv:>12.2f} {mean_ungraphed_euler_N:>12.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_euler_kv/n_euler_evals_N:>12.2f} {mean_ungraphed_euler_N/n_euler_evals_N:>12.2f}")
+    print(f"{'Speedup vs eager':<35} {euler_N_graph_speedup_kv:>12.2f}x")
     print("=" * W)
     print(f"  CUDA Graph vs Eager  (Euler BS=1, steps={args.num_steps}, {n_euler_evals_bs1} evals)")
-    print(f"{'Metric':<35} {'Graph KV':>12} {'Graph Ring':>12} {'Eager KV':>12}")
+    print(f"{'Metric':<35} {'Graph KV':>12} {'Eager KV':>12}")
     print("-" * W)
-    print(f"{'Total (ms)':<35} {mean_graphed_euler_bs1_kv:>12.2f} {mean_graphed_euler_bs1_ring:>12.2f} {mean_euler_cached:>12.2f}")
-    print(f"{'ms/model_eval':<35} {mean_graphed_euler_bs1_kv/n_euler_evals_bs1:>12.2f} {mean_graphed_euler_bs1_ring/n_euler_evals_bs1:>12.2f} {mean_euler_cached/n_euler_evals_bs1:>12.2f}")
-    print(f"{'Speedup vs eager KV':<35} {euler_bs1_graph_speedup_kv:>12.2f}x {mean_euler_cached_ring/mean_graphed_euler_bs1_ring:>12.2f}x")
-    print(f"{'Ring/KV ratio':<35} {graphed_euler_bs1_kv_vs_ring:>12.2f}x")
+    print(f"{'Total (ms)':<35} {mean_graphed_euler_bs1_kv:>12.2f} {mean_euler_cached:>12.2f}")
+    print(f"{'ms/model_eval':<35} {mean_graphed_euler_bs1_kv/n_euler_evals_bs1:>12.2f} {mean_euler_cached/n_euler_evals_bs1:>12.2f}")
+    print(f"{'Speedup vs eager KV':<35} {euler_bs1_graph_speedup_kv:>12.2f}x")
     print("=" * W)
 
     print()
@@ -821,14 +876,10 @@ def main():
     print(f"|--------|-----------|---------|-----------------|")
     print(f"| Euler graphed KV (N={args.n_candidates})    | {mean_graphed_euler_kv:.2f} | "
           f"{mean_graphed_euler_kv/n_euler_evals_N:.2f} | **{euler_N_graph_speedup_kv:.2f}x** |")
-    print(f"| Euler graphed Ring (N={args.n_candidates})  | {mean_graphed_euler_ring:.2f} | "
-          f"{mean_graphed_euler_ring/n_euler_evals_N:.2f} | **{euler_N_graph_speedup_ring:.2f}x** |")
     print(f"| Euler eager   (N={args.n_candidates})    | {mean_ungraphed_euler_N:.2f} | "
           f"{mean_ungraphed_euler_N/n_euler_evals_N:.2f} | 1.00x |")
     print(f"| Euler graphed KV (BS=1)           | {mean_graphed_euler_bs1_kv:.2f} | "
           f"{mean_graphed_euler_bs1_kv/n_euler_evals_bs1:.2f} | **{euler_bs1_graph_speedup_kv:.2f}x** |")
-    print(f"| Euler graphed Ring (BS=1)         | {mean_graphed_euler_bs1_ring:.2f} | "
-          f"{mean_graphed_euler_bs1_ring/n_euler_evals_bs1:.2f} | **{mean_euler_cached_ring/mean_graphed_euler_bs1_ring:.2f}x** |")
     print(f"| Euler KV-cached eager (BS=1)   | {mean_euler_cached:.2f} | "
           f"{mean_euler_cached/n_euler_evals_bs1:.2f} | 1.00x |")
 
@@ -864,6 +915,39 @@ def main():
           f"{mean_slide_ring/args.n_roll_frames:.2f} | **{slide_speedup:.2f}x** |")
     print(f"| Physical shift | {mean_slide_phys:.2f} | "
           f"{mean_slide_phys/args.n_roll_frames:.2f} | 1.00x |")
+
+    # --- Rolling inference benchmarks ---
+    times_rolling_phys = bench_rolling_inference_physical(
+        model, ctx_latents, ctx_actions, action,
+        args.n_roll_frames, args.cem_ode_steps, args.warmup, args.repeats,
+    )
+    times_rolling_ring = bench_rolling_inference_ring(
+        model, ctx_latents, ctx_actions, action,
+        args.n_roll_frames, args.cem_ode_steps, args.warmup, args.repeats,
+    )
+
+    mean_rolling_phys    = sum(times_rolling_phys) / len(times_rolling_phys)
+    mean_rolling_ring    = sum(times_rolling_ring) / len(times_rolling_ring)
+    rolling_speedup      = mean_rolling_phys / mean_rolling_ring
+    rolling_ms_per_frame_phys = mean_rolling_phys / args.n_roll_frames
+    rolling_ms_per_frame_ring = mean_rolling_ring / args.n_roll_frames
+
+    print()
+    print("=" * W)
+    print(f"  Rolling Inference  ({args.n_roll_frames} frames × {args.cem_ode_steps} ODE steps, n_ctx={args.n_ctx})")
+    print(f"{'Metric':<35} {'Ring':>12} {'Physical':>12}")
+    print("-" * W)
+    print(f"{'Total (ms)':<35} {mean_rolling_ring:>12.2f} {mean_rolling_phys:>12.2f}")
+    print(f"{'ms/frame':<35} {rolling_ms_per_frame_ring:>12.2f} {rolling_ms_per_frame_phys:>12.2f}")
+    print(f"{'Ring speedup':<35} {rolling_speedup:>12.2f}x")
+    print("=" * W)
+
+    print()
+    print(f"### Rolling Inference ({args.n_roll_frames} frames × {args.cem_ode_steps} ODE steps)")
+    print(f"| Strategy | Total (ms) | ms/frame | Speedup |")
+    print(f"|----------|-----------|----------|---------|")
+    print(f"| Ring buffer    | {mean_rolling_ring:.2f} | {rolling_ms_per_frame_ring:.2f} | **{rolling_speedup:.2f}x** |")
+    print(f"| Physical shift | {mean_rolling_phys:.2f} | {rolling_ms_per_frame_phys:.2f} | 1.00x |")
 
 
 if __name__ == "__main__":
