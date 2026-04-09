@@ -289,7 +289,7 @@ def main():
     """Run all profiling benchmarks."""
     device = torch.device("cuda")
     dtype  = torch.float16
-    N_CTX  = 8
+    N_CTX  = 4
     N      = 64
     NUM_ODE_STEPS = 4
     NUM_STEPS_BS1 = 8

@@ -685,7 +685,7 @@ def bench_slide_ring(model, ctx_latents, ctx_actions, action, n_roll_frames, war
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_steps",    type=int, default=8)
-    parser.add_argument("--n_ctx",        type=int, default=8)
+    parser.add_argument("--n_ctx",        type=int, default=4)
     parser.add_argument("--warmup",       type=int, default=5)
     parser.add_argument("--repeats",      type=int, default=50)
     # MPC params
