@@ -33,7 +33,17 @@
       "Bash(echo \"PID: $!\")",
       "Bash(python -m py_compile models/cache.py inference/graph_solver.py)",
       "Bash(python -m py_compile profiler/profile_colab.py)",
-      "Bash(python -m py_compile inference/bench.py)"
+      "Bash(python -m py_compile inference/bench.py)",
+      "Bash(python visualizations/plot_benchmarks.py)",
+      "Bash(pdftoppm -png 1_kv_cache_batch_dependency.pdf 1_kv_cache_batch_dependency)",
+      "Bash(pdftoppm -png 2_ring_buffer_isolation_vs_reality.pdf 2_ring_buffer_isolation_vs_reality)",
+      "Bash(pdftoppm -png 3_cuda_graph_speedup.pdf 3_cuda_graph_speedup)",
+      "Bash(pdftoppm -png 4_optimization_leaderboard.pdf 4_optimization_leaderboard)",
+      "Bash(pdftoppm -png 5_amortization_window.pdf 5_amortization_window)",
+      "Bash(python:*)",
+      "Bash(convert -density 300 6_kv_cache_memory_overhead.pdf -quality 95 6_kv_cache_memory_overhead_from_pdf.png)",
+      "Bash(ls -lh 6_kv_cache_memory_overhead*.png)",
+      "Bash(pdftoppm -png -r 300 6_kv_cache_memory_overhead.pdf 6_kv_cache_memory_overhead_converted)"
     ]
   },
   "outputStyle": "Explanatory"

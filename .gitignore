@@ -4,3 +4,4 @@ claude.md
 .vscode
 outputs/
 *.pt
+*.pt.trace.json
