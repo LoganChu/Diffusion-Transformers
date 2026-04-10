@@ -62,7 +62,7 @@ def make_workload_euler_bs1_cached(model, ctx_latents, ctx_actions, action, num_
     def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype)
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
             x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
             for i in range(num_steps):
                 t_buf.fill_(i * dt)
@@ -84,7 +84,7 @@ def make_workload_euler_bs1_recompute(model, ctx_latents, ctx_actions, action, n
             x = torch.randn(1, IN_CHANNELS, LATENT_H, LATENT_W, device=device, dtype=dtype)
             for i in range(num_steps):
                 cache = _make_cache(n_ctx_tokens, device, dtype)
-                model.prefill_cache(ctx_latents, ctx_actions, cache)
+                model.prefill_cache(ctx_latents, cache)
                 t_val = torch.full((1,), i * dt, device=device, dtype=dtype)
                 v = model(x, t_val, action, cache=cache)
                 x = x + dt * v
@@ -199,7 +199,7 @@ def make_workload_slide_physical(model, ctx_latents, ctx_actions, n_roll_frames,
     def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype)
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
             for frame_idx in range(n_roll_frames):
                 k_new, v_new = n_frame_kvs[frame_idx]
                 for layer_idx in range(DEPTH):
@@ -225,7 +225,7 @@ def make_workload_slide_ring(model, ctx_latents, ctx_actions, n_roll_frames, n_f
     def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
             for frame_idx in range(n_roll_frames):
                 k_new, v_new = n_frame_kvs[frame_idx]
                 for layer_idx in range(DEPTH):
@@ -252,7 +252,7 @@ def make_workload_rolling_inference_physical(
     def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype)
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
             for frame_idx in range(n_roll_frames):
                 k_new, v_new = n_frame_kvs[frame_idx]
                 for layer_idx in range(DEPTH):
@@ -283,7 +283,7 @@ def make_workload_rolling_inference_ring(
     def workload():
         with torch.amp.autocast("cuda", dtype=torch.float16):
             cache = _make_cache(n_ctx_tokens, device, dtype, cache_type="ring")
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
             for frame_idx in range(n_roll_frames):
                 k_new, v_new = n_frame_kvs[frame_idx]
                 for layer_idx in range(DEPTH):

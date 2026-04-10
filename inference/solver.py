@@ -24,7 +24,6 @@ from models.dit import DEPTH, HEAD_DIM, IN_CHANNELS, LATENT_H, LATENT_W, NUM_HEA
 def sample_heun_cached(
     model,
     ctx_latents: torch.Tensor,
-    ctx_actions: torch.Tensor,
     action: torch.Tensor,
     num_steps: int = 8,
 ) -> torch.Tensor:
@@ -33,7 +32,6 @@ def sample_heun_cached(
     Args:
         model: DiTSmall instance (eval mode, float16).
         ctx_latents: [B, n_ctx_frames, 16, 8, 8] context frames.
-        ctx_actions: [B, 4] most recent context cond vector [dx,dy,dz,gripper].
         action: [B, 4] cond vector for the predicted frame.
         num_steps: number of ODE integration steps.
     Returns:
@@ -51,7 +49,7 @@ def sample_heun_cached(
             n_ctx_tokens, NUM_PATCHES,
             device=device, dtype=dtype,
         )
-        model.prefill_cache(ctx_latents, ctx_actions, cache)
+        model.prefill_cache(ctx_latents, cache)
 
         x = torch.randn(
             B, IN_CHANNELS, LATENT_H, LATENT_W,

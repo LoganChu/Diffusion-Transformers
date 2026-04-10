@@ -458,14 +458,12 @@ class DiTSmall(nn.Module):
     def prefill_cache(
         self,
         ctx_latents: torch.Tensor,
-        ctx_actions: torch.Tensor,
         cache: KVCache,
     ) -> None:
         """Prefill KV cache with context frames. Call once before ODE loop.
 
         Args:
             ctx_latents: [B, n_ctx_frames, 16, 8, 8] historical latent frames
-            ctx_actions: [B, 8] most recent context action
             cache: KVCache to fill
         """
         with record_function("DiTSmall.prefill_cache"), torch.amp.autocast("cuda", dtype=torch.float16):
@@ -479,9 +477,11 @@ class DiTSmall(nn.Module):
                 frame_tokens.append(tok)
             x_ctx = torch.cat(frame_tokens, dim=1)  # [B, N_ctx, HIDDEN_DIM]
 
-            # Context conditioning: t=1.0 (fully denoised), fixed action
+            # Context conditioning: t=1.0 (fully denoised, clean latents)
+            # Only time embedding, no action conditioning for context
+            # (action conditioning is only for the prediction step)
             t_ones = torch.ones(B, device=x_ctx.device, dtype=x_ctx.dtype)
-            c_ctx = self.t_embed(t_ones) + self.action_embed(ctx_actions)
+            c_ctx = self.t_embed(t_ones)
 
             for layer_idx, block in enumerate(self.blocks):
                 x_ctx = block.forward_prefill(x_ctx, c_ctx, cache, layer_idx)

@@ -65,7 +65,6 @@ def main(args):
 
         start_idx = np.random.randint(args.n_ctx, max_start)
         ctx_latents = latents[start_idx - args.n_ctx:start_idx]  # [n_ctx, 16, 8, 8]
-        ctx_actions = actions[start_idx - 1:start_idx]  # [1, 4] — most recent action
         pred_action = actions[start_idx]  # [4] — action to predict next frame for
         gt_latent = latents[start_idx + 1]  # [16, 8, 8] — ground truth next frame
 
@@ -73,14 +72,12 @@ def main(args):
     print(f"Running inference with {args.n_ctx} context frames...")
     with torch.no_grad():
         ctx_latents_t = torch.from_numpy(ctx_latents).float().to(device).unsqueeze(0)  # [1, n_ctx, 16, 8, 8]
-        ctx_actions_t = torch.from_numpy(ctx_actions).float().to(device).unsqueeze(0)  # [1, 1, 4]
         pred_action_t = torch.from_numpy(pred_action).float().to(device).unsqueeze(0)  # [1, 4]
 
-        # Predict next latent
+        # Predict next latent: given context frames + action, predict next frame
         pred_latent = sample_heun_cached(
             model,
             ctx_latents_t,
-            ctx_actions_t,
             pred_action_t,
             num_steps=8,
         )  # [1, 16, 8, 8]

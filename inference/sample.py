@@ -9,7 +9,6 @@ from models.dit import DEPTH, HEAD_DIM, NUM_HEADS, NUM_PATCHES, IN_CHANNELS, LAT
 def sample_ode_cached(
     model,
     ctx_latents: torch.Tensor,
-    ctx_actions: torch.Tensor,
     action: torch.Tensor,
     num_steps: int = 8,
 ) -> torch.Tensor:
@@ -18,7 +17,6 @@ def sample_ode_cached(
     Args:
         model: DiTSmall instance (should be in eval mode, float16)
         ctx_latents: [B, n_ctx_frames, 16, 8, 8] context frames
-        ctx_actions: [B, 4] most recent context cond vector [dx,dy,dz,gripper]
         action: [B, 4] cond vector for the predicted frame
         num_steps: number of Euler ODE steps
     Returns:
@@ -38,7 +36,7 @@ def sample_ode_cached(
         )
 
         # 2. Prefill context K/V (once, outside loop)
-        model.prefill_cache(ctx_latents, ctx_actions, cache)
+        model.prefill_cache(ctx_latents, cache)
 
         # 3. ODE loop — zero allocation
         x = torch.randn(

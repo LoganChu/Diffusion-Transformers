@@ -177,7 +177,7 @@ class GraphedEulerStep:
         # Context prefill — outside graph; cache state feeds into graph replay.
         nvtx.range_push("GraphedEulerStep.prefill")
         with record_function("GraphedEulerStep.prefill"):
-            model.prefill_cache(ctx_latents_1, a_cond[0:1], self.cache)
+            model.prefill_cache(ctx_latents_1, self.cache)
         nvtx.range_pop()
 
         # Copy variable inputs into pre-allocated buffers.
@@ -301,7 +301,7 @@ class GraphedHeunSolver:
         """
         nvtx.range_push("GraphedHeunSolver.prefill")
         with record_function("GraphedHeunSolver.prefill"):
-            model.prefill_cache(ctx_latents, ctx_actions, self.cache)
+            model.prefill_cache(ctx_latents, self.cache)
         nvtx.range_pop()
 
         self.action.copy_(action)

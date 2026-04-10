@@ -168,7 +168,7 @@ def test_heun_multistep_parity():
         """Run Heun ODE loop with the given cache factory."""
         x = x0.clone()
         cache = make_cache_fn()
-        model.prefill_cache(ctx_latents, ctx_actions, cache)
+        model.prefill_cache(ctx_latents, cache)
 
         for i in range(num_steps):
             t_val = torch.tensor([i * dt] * B, device=DEVICE, dtype=dtype)
@@ -190,7 +190,7 @@ def test_heun_multistep_parity():
         for i in range(num_steps):
             # Fresh cache + prefill for v1
             cache = _make_cache(n_ctx_tokens, dtype=dtype)
-            model.prefill_cache(ctx_latents, ctx_actions, cache)
+            model.prefill_cache(ctx_latents, cache)
 
             t_val = torch.tensor([i * dt] * B, device=DEVICE, dtype=dtype)
             v1 = model(x, t_val, action, cache=cache)
