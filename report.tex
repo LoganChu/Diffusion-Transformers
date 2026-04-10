@@ -131,34 +131,33 @@ the dataflow.
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-    node distance=0.45cm and 0.3cm,
-    block/.style={draw, rounded corners, minimum width=1.9cm,
-                  minimum height=0.6cm, font=\scriptsize,
-                  fill=blue!8, align=center},
-    data/.style={draw, rounded corners, minimum width=1.5cm,
-                 minimum height=0.5cm, font=\scriptsize,
-                 fill=orange!12, align=center},
-    arr/.style={-{Stealth[length=4pt]}, thick}
+    node distance=0.6cm,
+    block/.style={draw, rounded corners, minimum width=2.2cm,
+                  minimum height=0.5cm, font=\tiny,
+                  fill=blue!10, align=center},
+    data/.style={draw, rounded corners, minimum width=2.0cm,
+                 minimum height=0.45cm, font=\tiny,
+                 fill=orange!15, align=center},
+    arr/.style={->, thick, >= stealth}
 ]
-  \node[block] (env) {ManiSkill 3.0\\128 envs (GPU)};
-  \node[data,  right=of env] (rgb) {RGB\\$128{\times}128$};
-  \node[block, right=of rgb] (vae) {Cosmos\\CI16$\times$16};
-  \node[data,  right=of vae] (lat) {Latent\\$16{\times}8{\times}8$};
-  \node[data,  below=of lat] (h5) {HDF5};
-  \node[block, below=of h5]  (dit) {DiT-S\\(CFM)};
-  \node[block, left=of dit]  (cache) {KV Cache\\CUDA Graph};
-  \node[data,  left=of cache](pred) {Predicted\\latent};
+  \node[block] (env) {ManiSkill 3.0\\128 envs};
+  \node[data, below=of env] (rgb) {RGB $128 \times 128$};
+  \node[block, below=of rgb] (vae) {Cosmos Encoder};
+  \node[data, below=of vae] (lat) {Latent $16 \times 8 \times 8$};
+  \node[data, below=of lat] (h5) {HDF5 Store};
+  \node[block, below=of h5] (dit) {DiT-S + CFM};
+  \node[block, below=of dit] (cache) {KV Cache\\CUDA Graphs};
+  \node[data, below=of cache] (out) {Predicted\\Latent};
 
   \draw[arr] (env) -- (rgb);
   \draw[arr] (rgb) -- (vae);
   \draw[arr] (vae) -- (lat);
   \draw[arr] (lat) -- (h5);
-  \draw[arr] (h5)  -- (dit);
+  \draw[arr] (h5) -- (dit);
   \draw[arr] (dit) -- (cache);
-  \draw[arr] (cache) -- (pred);
+  \draw[arr] (cache) -- (out);
 \end{tikzpicture}
-\caption{End-to-end pipeline from environment interaction to
-cached latent prediction.}
+\caption{End-to-end inference pipeline from environment to cached prediction.}
 \label{fig:pipeline}
 \end{figure}
 

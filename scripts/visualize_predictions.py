@@ -33,7 +33,11 @@ def main(args):
     print(f"Loading model from {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model = DiTSmall().to(device)
-    model.load_state_dict(ckpt["model"])
+    # Strip torch.compile _orig_mod. prefix if present
+    state_dict = ckpt["model"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
     print("Model loaded.")
 
