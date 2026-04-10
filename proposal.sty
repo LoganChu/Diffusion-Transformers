@@ -1,0 +1,111 @@
+\if@twocolumn\else\input twocolumn.sty\fi
+\usepackage{mathptmx}  % times roman, including math (where possible)
+
+% hopefully embeds all fonts in pdf
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{pslatex}
+
+% appearance
+\usepackage[kerning,spacing]{microtype} % more compact and arguably nicer
+
+% refs and bib
+\usepackage{cite}               % order multiple entries in \cite{...}
+\usepackage{breakurl}           % break too-long urls in refs
+\usepackage{url}                % allow \url in bibtex for clickable links
+\usepackage{xcolor}             % color definitions, to be use for...
+\usepackage[]{hyperref}         % ...clickable refs within pdf...
+\hypersetup{                    % ...like so
+  colorlinks,
+  linkcolor={green!80!black},
+  citecolor={red!70!black},
+  urlcolor={blue!70!black}
+}
+
+% graphics, tables, algorithms
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,calc}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% math and lists
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+\setlength{\textheight}{9.0in}
+\setlength{\columnsep}{0.33in}
+\setlength{\textwidth}{7.00in}
+
+\setlength{\topmargin}{0.0in}
+
+\setlength{\headheight}{0.0in}
+
+\setlength{\headsep}{0.0in}
+
+\addtolength{\oddsidemargin}{-0.25in}
+\addtolength{\evensidemargin}{-0.25in}
+
+
+\def\maketitle{\par
+ \begingroup
+   \renewcommand\thefootnote{\fnsymbol{footnote}}%
+   \def\@makefnmark{\hbox to\z@{$\m@th^{\@thefnmark}$\hss}}%
+    \long\def\@makefntext##1{\parindent 1em\noindent
+            \hbox to1.8em{\hss$\m@th^{\@thefnmark}$}##1}%
+   \if@twocolumn
+     \twocolumn[\@maketitle]%
+     \else \newpage
+     \global\@topnum\z@
+     \@maketitle \fi\@thanks
+ \endgroup
+ \setcounter{footnote}{0}%
+ \let\maketitle\relax
+ \let\@maketitle\relax
+ \gdef\@thanks{}\gdef\@author{}\gdef\@title{}\let\thanks\relax}
+
+\def\@maketitle{\newpage
+ \vbox to 2.5in{
+ \vspace*{\fill}
+ \vskip 2em
+ \begin{center}%
+  {\Large\bf \@title \par}%
+  \vskip 0.375in minus 0.300in
+  {\large\it
+   \lineskip .5em
+   \begin{tabular}[t]{c}\@author
+   \end{tabular}\par}%
+ \end{center}%
+ \par
+ \vspace*{\fill}
+% \vskip 1.5em
+ }
+}
+
+%
+% The abstract is preceded by a 12-pt bold centered heading
+\def\abstract{\begin{center}%
+{\large\bf \abstractname\vspace{-.5em}\vspace{\z@}}%
+\end{center}}
+\def\endabstract{}
+
+%
+% Main section titles are 12-pt bold.  Others can be same or smaller.
+%
+\def\section{\@startsection {section}{1}{\z@}{-3.5ex plus-1ex minus
+    -.2ex}{2.3ex plus.2ex}{\reset@font\large\bf}}
+
+\def\subsection{\@startsection {subsection}{2}{\z@}{-2.5ex plus-1ex minus
+    -.2ex}{1.5ex plus.2ex}{\reset@font\normalsize\bf}}
+
+\def\subsubsection{\@startsection {subsubsection}{3}{\z@}{-2ex plus-.5ex minus
+    -.1ex}{1ex plus.1ex}{\reset@font\normalsize\it}}
+
+\def\paragraph{\@startsection {paragraph}{4}{\z@}{1.5ex plus.5ex minus
+    .1ex}{-1em}{\reset@font\normalsize\bf}}
+
+\endinput

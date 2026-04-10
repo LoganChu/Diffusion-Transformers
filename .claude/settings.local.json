@@ -43,7 +43,11 @@
       "Bash(python:*)",
       "Bash(convert -density 300 6_kv_cache_memory_overhead.pdf -quality 95 6_kv_cache_memory_overhead_from_pdf.png)",
       "Bash(ls -lh 6_kv_cache_memory_overhead*.png)",
-      "Bash(pdftoppm -png -r 300 6_kv_cache_memory_overhead.pdf 6_kv_cache_memory_overhead_converted)"
+      "Bash(pdftoppm -png -r 300 6_kv_cache_memory_overhead.pdf 6_kv_cache_memory_overhead_converted)",
+      "Bash(xargs ls:*)",
+      "Bash(pdflatex -interaction=nonstopmode report.tex)",
+      "Bash(cat)",
+      "Read(//tmp/**)"
     ]
   },
   "outputStyle": "Explanatory"

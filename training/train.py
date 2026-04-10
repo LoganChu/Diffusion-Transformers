@@ -121,21 +121,30 @@ def make_validation_gif(
     x_pred = sample_heun(model, cond, ctx_latents=ctx, num_steps=8)
 
     # Stack ground-truth and predicted for comparison
-    # Each is [4, 16, 8, 8] — take first 3 channels as pseudo-RGB
     frames = []
     for pair_idx in range(min(4, x_1.shape[0])):
-        gt = x_1[pair_idx, :3].float().cpu()
-        pred = x_pred[pair_idx, :3].float().cpu()
+        if decoder is not None:
+            # Real RGB decoding: [B, 16, 8, 8] -> [B, 3, 128, 128]
+            gt_rgb = decoder.decode(x_1[pair_idx:pair_idx+1].cuda())[0].cpu()   # [3, 128, 128]
+            pred_rgb = decoder.decode(x_pred[pair_idx:pair_idx+1].cuda())[0].cpu()  # [3, 128, 128]
+        else:
+            # Fallback: pseudo-RGB from first 3 latent channels (upscaled for visibility)
+            gt_rgb = x_1[pair_idx, :3].float().cpu()     # [3, 8, 8]
+            pred_rgb = x_pred[pair_idx, :3].float().cpu()  # [3, 8, 8]
+            # Normalize to [0, 1]
+            for tensor in [gt_rgb, pred_rgb]:
+                tensor.sub_(tensor.min()).div_(tensor.max() - tensor.min() + 1e-5)
+            # Upscale to 128x128 for visibility
+            gt_rgb = torch.nn.functional.interpolate(
+                gt_rgb.unsqueeze(0), size=128, mode="bilinear", align_corners=False
+            )[0]
+            pred_rgb = torch.nn.functional.interpolate(
+                pred_rgb.unsqueeze(0), size=128, mode="bilinear", align_corners=False
+            )[0]
 
-        # Normalize to [0, 255]
-        for tensor in [gt, pred]:
-            tensor.sub_(tensor.min()).div_(tensor.max() - tensor.min() + 1e-5)
-
-        # Side-by-side: [3, 8, 16] -> [8, 16, 3]
-        combined = torch.cat([gt, pred], dim=2)  # [3, 8, 16]
-        frame = (combined.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        # Upscale for visibility
-        frame = np.repeat(np.repeat(frame, 16, axis=0), 16, axis=1)
+        # Side-by-side: [3, 128, 256]
+        combined = torch.cat([gt_rgb, pred_rgb], dim=2)
+        frame = (combined.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
         frames.append(frame)
 
     gif_path = os.path.join(output_dir, f"val_step_{step:06d}.gif")
@@ -203,6 +212,16 @@ def train(args):
         print("Compiling model with torch.compile(mode='default') ...")
         model = torch.compile(model, mode="default")
         print("Compilation done.")
+
+    # ---- VAE Decoder for validation GIF generation ----
+    vae_decoder = None
+    if args.cosmos_ckpt:
+        from data.ingest import CosmosLatentDecoder
+        try:
+            vae_decoder = CosmosLatentDecoder(args.cosmos_ckpt)
+            print(f"Loaded VAE decoder from {args.cosmos_ckpt}")
+        except Exception as e:
+            print(f"Warning: Failed to load VAE decoder: {e}")
 
     # ---- Optimizer + Scheduler ----
     optimizer = torch.optim.AdamW(
@@ -364,7 +383,7 @@ def train(args):
                     log_dict = {"val/loss": val_loss}
 
                     gif_path = make_validation_gif(
-                        model, val_loader, global_step, args.gif_dir
+                        model, val_loader, global_step, args.gif_dir, decoder=vae_decoder
                     )
                     if gif_path is not None:
                         import wandb

@@ -427,6 +427,34 @@ class CosmosLatentEncoder:
         self.stream.synchronize()
 
 
+class CosmosLatentDecoder:
+    """Cosmos-Tokenizer-CI16x16 decoder.
+
+    Input:  [B, 16, 8, 8]   float32 latents
+    Output: [B, 3, 128, 128] float32 RGB in [0, 1]
+    """
+
+    def __init__(self, ckpt_dir: str):
+        decoder_jit = os.path.join(ckpt_dir, "decoder.jit")
+        assert os.path.isfile(decoder_jit), f"decoder.jit not found at {decoder_jit}"
+        from cosmos_tokenizer.image_lib import ImageTokenizer
+        self.decoder = ImageTokenizer(checkpoint_dec=decoder_jit)
+
+    @torch.no_grad()
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to RGB frames.
+
+        Args:
+            latents: [B, 16, 8, 8] float32 latent tensor
+
+        Returns:
+            [B, 3, 128, 128] float32 RGB tensor in [0, 1]
+        """
+        bf16_buf = latents.to(torch.bfloat16)
+        rgb = self.decoder.decode(bf16_buf)  # [B, 3, 128, 128] bfloat16
+        return rgb.to(torch.float32).clamp(0, 1)
+
+
 # ---------------------------------------------------------------------------
 # 4. HDF5 Writer (sync version)
 # ---------------------------------------------------------------------------
