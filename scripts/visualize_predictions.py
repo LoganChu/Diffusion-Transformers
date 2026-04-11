@@ -49,14 +49,29 @@ def main(args):
     # ---- Load data ----
     print(f"Loading latents from {args.data}")
     with h5py.File(args.data, "r") as f:
-        # Pick a random episode
+        # Pick a random episode (skip if it contains NaN)
         episode_names = list(f.keys())
         episode_idx = np.random.randint(len(episode_names))
-        episode_name = episode_names[episode_idx]
-        print(f"Using episode: {episode_name}")
+        max_tries = 10
+        tries = 0
 
-        episode_group = f[episode_name]
-        latents = episode_group["latents"][:]  # [T, 16, 8, 8]
+        while tries < max_tries:
+            episode_name = episode_names[episode_idx]
+            episode_group = f[episode_name]
+            latents = episode_group["latents"][:]  # [T, 16, 8, 8]
+
+            # Check if this episode has valid data
+            if not np.isnan(latents).any():
+                print(f"Using episode: {episode_name}")
+                break
+
+            tries += 1
+            episode_idx = np.random.randint(len(episode_names))
+
+        if tries >= max_tries:
+            print(f"Could not find a valid episode after {max_tries} tries. Exiting.")
+            return
+
         actions = episode_group["actions"][:]  # [T, 4]
 
         print(f"Episode shape: latents={latents.shape}, actions={actions.shape}")
@@ -78,6 +93,9 @@ def main(args):
         ctx_latents_t = torch.from_numpy(ctx_latents).float().to(device).unsqueeze(0)  # [1, n_ctx, 16, 8, 8]
         pred_action_t = torch.from_numpy(pred_action).float().to(device).unsqueeze(0)  # [1, 4]
 
+        print(f"  Context latents: min={ctx_latents_t.min():.4f}, max={ctx_latents_t.max():.4f}, mean={ctx_latents_t.mean():.4f}")
+        print(f"  Action: {pred_action_t.squeeze().cpu().numpy()}")
+
         # Predict next latent: given context frames + action, predict next frame
         pred_latent = sample_heun_cached(
             model,
@@ -85,6 +103,9 @@ def main(args):
             pred_action_t,
             num_steps=8,
         )  # [1, 16, 8, 8]
+
+        print(f"  Predicted latent: min={pred_latent.min():.4f}, max={pred_latent.max():.4f}, mean={pred_latent.mean():.4f}")
+        print(f"  Contains NaN: {torch.isnan(pred_latent).any().item()}")
 
         gt_latent_t = torch.from_numpy(gt_latent).float().to(device).unsqueeze(0)  # [1, 16, 8, 8]
 
@@ -98,29 +119,39 @@ def main(args):
         for i in range(ctx_latents.shape[0]):
             latent = torch.from_numpy(ctx_latents[i]).float().to(device).unsqueeze(0)  # [1, 16, 8, 8]
             rgb = decoder.decode(latent)[0].cpu()  # [3, 128, 128]
-            ctx_frames.append((rgb.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+            # Handle NaN and convert to uint8
+            rgb_np = rgb.permute(1, 2, 0).numpy()
+            rgb_np = np.nan_to_num(rgb_np, nan=0.0)  # Replace NaN with 0
+            rgb_np = np.clip(rgb_np, 0, 1)  # Ensure [0, 1] range
+            ctx_frames.append((rgb_np * 255).astype(np.uint8))
 
         # Decode predicted frame
         pred_rgb = decoder.decode(pred_latent)[0].cpu()  # [3, 128, 128]
-        pred_frame = (pred_rgb.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        pred_np = pred_rgb.permute(1, 2, 0).numpy()
+        pred_np = np.nan_to_num(pred_np, nan=0.0)
+        pred_np = np.clip(pred_np, 0, 1)
+        pred_frame = (pred_np * 255).astype(np.uint8)
 
         # Decode ground truth frame
         gt_rgb = decoder.decode(gt_latent_t)[0].cpu()  # [3, 128, 128]
-        gt_frame = (gt_rgb.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        gt_np = gt_rgb.permute(1, 2, 0).numpy()
+        gt_np = np.nan_to_num(gt_np, nan=0.0)
+        gt_np = np.clip(gt_np, 0, 1)
+        gt_frame = (gt_np * 255).astype(np.uint8)
 
     print("Decoding done.")
+    print(f"Pred frame stats: min={pred_frame.min()}, max={pred_frame.max()}, mean={pred_frame.mean():.1f}")
+    print(f"GT frame stats: min={gt_frame.min()}, max={gt_frame.max()}, mean={gt_frame.mean():.1f}")
 
     # ---- Create comparison frames ----
     print("Creating comparison visualization...")
     frames = []
-    for ctx_frame in ctx_frames:
+    for i, ctx_frame in enumerate(ctx_frames):
         # Stack [ctx] side-by-side with prediction/gt
         combined = np.concatenate([ctx_frame, pred_frame, gt_frame], axis=1)  # [128, 384, 3]
         frames.append(combined)
-
-    # Add a final frame showing [pred | gt] more clearly
-    combined_final = np.concatenate([pred_frame, gt_frame], axis=1)  # [128, 256, 3]
-    frames.append(combined_final)
+        if i == 0:
+            print(f"Frame shape: {combined.shape}")
 
     # ---- Save GIF ----
     print(f"Saving GIF to {args.out}")
