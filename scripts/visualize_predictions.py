@@ -8,7 +8,7 @@ Usage:
         --ckpt checkpoints/model.pt \\
         --data trajectories.h5 \\
         --cosmos_ckpt pretrained_ckpts/Cosmos-Tokenizer-CI16x16 \\
-        --n_ctx 4 --out predictions.gif
+        --n_ctx 4 --num_steps 16 --out predictions_16steps.gif
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def main(args):
             model,
             ctx_latents_t,
             pred_action_t,
-            num_steps=8,
+            num_steps=args.num_steps,
         )  # [1, 16, 8, 8]
 
         print(f"  Predicted latent: min={pred_latent.min():.4f}, max={pred_latent.max():.4f}, mean={pred_latent.mean():.4f}")
@@ -195,6 +195,12 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Number of context frames to condition on",
+    )
+    parser.add_argument(
+        "--num_steps",
+        type=int,
+        default=8,
+        help="Number of ODE solver steps for denoising",
     )
     parser.add_argument(
         "--out",
