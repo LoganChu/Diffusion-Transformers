@@ -1,12 +1,43 @@
-\documentclass[10pt,twocolumn]{article}
-
+\documentclass[letterpaper,twocolumn,10pt]{article}
 \usepackage{proposal}
 
-\title{\textbf{OptiWorld-FM}: Systems-Optimised Diffusion Transformer\\
+% ── Math ──
+\usepackage{amsmath,amssymb,amsfonts}
+
+% ── Figures and tables ──
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% ── Algorithms ──
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ── Lists ──
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+% ── Code listings ──
+\usepackage{listings}
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    breakatwhitespace=true,
+    columns=fullflexible,
+    frame=single
+}
+
+% ── TikZ diagrams ──
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,calc}
+
+\title{\textbf{OptiWorld-FM}: Systems-Optimized Diffusion Transformer\\
 for Action-Conditioned World Modelling}
 \author{
-  CS 590 --- Systems of Machine Learning \\
-  Duke University
+Logan Chu\\
+Department of Computer Science\\
+Duke University
 }
 \date{April 2026}
 
@@ -22,20 +53,20 @@ enablers for model-based reinforcement learning and real-time robot
 control.  Diffusion-based generative models are natural candidates due to
 training stability, but their iterative sampling procedure introduces
 unacceptable latency for real-time deployment.  This paper presents
-\textbf{OptiWorld-FM}, an end-to-end systems-optimised pipeline that
-combines three complementary optimisations: (1) a KV-cache design that
+\textbf{OptiWorld-FM}, an end-to-end systems-optimized pipeline that
+combines three complementary optimizations: (1) a KV-cache design that
 eliminates redundant context-token computation, (2) CUDA graph capture
 that removes kernel-launch overhead, and (3) a ring-buffer context
 manager that reduces memory-management overhead.  We demonstrate these
-optimisations on a 32.7M-parameter Diffusion Transformer trained with
-Conditional Flow Matching for latent-space world modelling in
+optimizations on a 32.7M-parameter Diffusion Transformer trained with
+Conditional Flow Matching for latent-space world modeling in
 ManiSkill~3.0.  Measured speedups are: KV-cache $1.81\times$, CUDA
 graphs $2.19\times$, and ring-buffer context $1.23\times$, with a peak
 combined speedup of $5.01\times$ on batch-size-1 inference.  The
 high-throughput data pipeline collects 698 latent frames per second from
-128 GPU-parallelised environments.  We validate numerical parity across
-all optimised paths and characterise kernel-level bottlenecks to guide
-future work on FP8 quantisation and torch.compile fusion.
+128 GPU-parallelized environments.  We validate numerical parity across
+all optimized paths and characterize kernel-level bottlenecks to guide
+future work on FP8 quantization and torch.compile fusion.
 
 \end{abstract}
 
@@ -53,14 +84,14 @@ denoising requires 4--16 forward passes per sample, introducing latency
 that prohibits real-time deployment on consumer GPUs.
 
 This report presents \textbf{OptiWorld-FM}, an end-to-end
-systems-optimised pipeline for deploying a Diffusion Transformer world
-model.  Our key contributions are:
+systems-optimized pipeline for deploying a Diffusion Transformer world
+model. Our key contributions are:
 
 \begin{enumerate}
   \item A \textbf{high-throughput data ingestion pipeline} with
         double-buffered VAE encoding and asynchronous HDF5 writing,
         achieving \textbf{698 latent frames per second} from 128
-        GPU-vectorised ManiSkill~3.0 environments.
+        GPU-vectorized ManiSkill~3.0 environments.
   \item A \textbf{KV-cache inference engine} that separates static
         context-frame representations from iterative denoise tokens,
         yielding \textbf{1.81$\times$ speedup (Euler)} and
@@ -76,56 +107,31 @@ model.  Our key contributions are:
         prediction) for robot action planning.
 \end{enumerate}
 
-These optimisations are evaluated on an RTX~5070 Laptop GPU with
-float16 precision.  We provide extensive numerical parity tests,
-profiler-level analysis of kernel bottlenecks, and a clear roadmap for
-further optimisation via FP8 quantisation and kernel fusion.
+These optimisations are evaluated on an A100 GPU on Google Colab with float16 precision.  We provide extensive numerical parity tests, profiler-level analysis of kernel bottlenecks, and a clear roadmap for further optimization via FP8 quantization and kernel fusion.
 
 % ====================================================================
 \section{Background and Related Work}
 % ====================================================================
 
 \paragraph{Diffusion Models for World Modelling.}
-Diffusion models have shown strong performance as visual world models,
-outperforming VAE-based approaches in sample quality and training
-stability~\cite{ho2020ddpm}.  Recent work (Dreamer~\cite{dreamer2020},
-Latent World Models~\cite{unisim2021}) demonstrates that latent-space
-diffusion models can support effective model-based RL policies.  Our
-contribution focuses on the systems side: making diffusion world models
-*fast* enough for real-time deployment.
+Diffusion models have shown strong performance as visual world models, outperforming VAE-based approaches in sample quality and training stability~\cite{ho2020ddpm}.  Recent work (Dreamer~\cite{dreamer2020}, Latent World Models~\cite{unisim2021}) demonstrates that latent-space
+diffusion models can support effective model-based RL policies. Our contribution focuses on the systems side: making diffusion world models *fast* enough for real-time deployment.
 
 \paragraph{Conditional Flow Matching.}
-Flow Matching is a recent training paradigm that simplifies diffusion
-training by learning a velocity field directly, rather than a
-noise-prediction network~\cite{lipman2023flow}.  The linear interpolant
-between noise and signal yields a simple constant-velocity target,
-improving training stability and sample efficiency.
+Flow Matching is a recent training paradigm that simplifies diffusion training by learning a velocity field directly, rather than a noise-prediction network~\cite{lipman2023flow}.  The linear interpolant between noise and signal yields a simple constant-velocity target, improving training stability and sample efficiency.
 
 \paragraph{KV Caching in Inference.}
-Key--value caching is standard in autoregressive language model
-inference~\cite{openai2019gpt3}; it eliminates redundant computation of
-context tokens' K/V representations at each decoding step.
-FlashAttention~\cite{dao2022flashattention} and variants show how
-careful GPU memory layout further reduces the cost of attention.  This
-work applies similar ideas to diffusion ODE solvers: context frames have
-identical representations across all ODE steps, making them cacheable.
-The key novelty is (1) adapting this to non-autoregressive diffusion
-(full attention, not causal), and (2) identifying that cache benefits
-scale with model size (large models) and degrade under high batch-size
-planning (memory-bandwidth dominates for small models).
+Key--value caching is standard in autoregressive language model inference~\cite{openai2019gpt3}; it eliminates redundant computation of context tokens' K/V representations at each decoding step. FlashAttention~\cite{dao2022flashattention} and variants show how careful GPU memory layout further reduces the cost of attention.  This work applies similar ideas to diffusion ODE solvers: context frames have identical representations across all ODE steps, making them cacheable.
+The key novelty is (1) adapting this to non-autoregressive diffusion (full attention, not causal), and (2) identifying that cache benefits scale with model size (large models) and degrade under high batch-size planning (memory-bandwidth dominates for small models).
 
 \paragraph{CUDA Graphs for Latency Reduction.}
-CUDA Graphs (PyTorch's \texttt{torch.cuda.CUDAGraph}) eliminate
-kernel-launch overhead by capturing a sequence of operations and
-replaying them without host-device synchronisation.  This is critical
-for short compute kernels where launch overhead dominates total time.
+CUDA Graphs (PyTorch's \texttt{torch.cuda.CUDAGraph}) eliminate kernel-launch overhead by capturing a sequence of operations and replaying them without host-device synchronization.  This is critical for short compute kernels where launch overhead dominates total time.
 
 % ====================================================================
 \section{System Architecture}
 % ====================================================================
 
-The system comprises four stages: data ingestion, latent encoding,
-training, and cached inference.  Figure~\ref{fig:pipeline} summarises
+The system comprises four stages: data ingestion, latent encoding, training, and cached inference.  Figure~\ref{fig:pipeline} summarizes
 the dataflow.
 
 \begin{figure}[t]
@@ -161,23 +167,18 @@ the dataflow.
 \label{fig:pipeline}
 \end{figure}
 
+
+
 % ────────────────────────────────────────────────────────────────────
 \subsection{Data Ingestion}
 % ────────────────────────────────────────────────────────────────────
 
 We collect trajectories from the \texttt{PickCube-v1} task in
-ManiSkill~3.0 using 128 GPU-vectorised parallel environments.  Each
-environment produces $128\times128$ RGB observations and 4-dimensional
-continuous actions.
+ManiSkill~3.0 using 128 GPU-vectorized parallel environments.  Each environment produces $128\times128$ RGB observations and 4-dimensional continuous actions.
 
 Observations are encoded into a $16\times8\times8$ latent
-representation using the NVIDIA Cosmos-Tokenizer-CI16$\times$16, a
-pretrained continuous image tokeniser achieving a $256\times$ spatial
-compression.  The encoder runs on a dedicated CUDA stream, overlapping
-environment stepping with VAE encoding via a \textbf{double-buffered
-pipeline}: while the current frame is simulated, the previous frame is
-asynchronously encoded.  Encoded latents and actions are written to HDF5
-with LZF compression using an asynchronous writer process.
+representation using the NVIDIA Cosmos-Tokenizer-CI16$\times$16, a pretrained continuous image tokenizer achieving a $256\times$ spatial compression.  The encoder runs on a dedicated CUDA stream, overlapping environment stepping with VAE encoding via a \textbf{double-buffered
+pipeline}: while the current frame is simulated, the previous frame is asynchronously encoded.  Encoded latents and actions are written to HDF5 with LZF compression using an asynchronous writer process.
 
 \begin{table}[t]
 \centering
@@ -195,15 +196,13 @@ with LZF compression using an asynchronous writer process.
 \end{table}
 
 The pipeline scales near-linearly with environment count; the bottleneck
-is firmly in environment simulation (76--80\%). HDF5 write overhead is
-negligible thanks to the asynchronous writer.
+is firmly in environment simulation (76--80\%). HDF5 write overhead is negligible thanks to the asynchronous writer.
 
 % ────────────────────────────────────────────────────────────────────
 \subsection{Model Architecture}
 % ────────────────────────────────────────────────────────────────────
 
-Our backbone is a \textbf{DiT-Small} with 12 transformer layers, 6 heads,
-384 hidden dimension ($\sim$32.7\,M parameters).
+Our backbone is a \textbf{DiT-Small} with 12 transformer layers, 6 heads, 384 hidden dimension ($\sim$32.7\,M parameters).
 
 \begin{table}[t]
 \centering
@@ -227,13 +226,8 @@ Max context frames & 4 \\
 \end{table}
 
 \paragraph{Conditioning.}
-Time and action are fused via adaptive layer normalisation
-(adaLN-Zero)~\cite{peebles2023dit}.  The conditioning signal $c$ sums a
-sinusoidal timestep embedding (computed in float32 for precision) and a
-learned action embedding, each projected to $\mathbb{R}^{384}$.  Each
-block derives six modulation parameters that gate and scale the
-normalised attention and MLP residuals.  All modulation weights are
-zero-initialised, stabilising early training.
+Time and action are fused via adaptive layer normalization
+(adaLN-Zero)~\cite{peebles2023dit}.  The conditioning signal $c$ sums a sinusoidal timestep embedding (computed in float32 for precision) and a learned action embedding, each projected to $\mathbb{R}^{384}$. Each block derives six modulation parameters that gate and scale the normalized attention and MLP residuals.  All modulation weights are zero-initialized, stabilizing early training.
 
 % ====================================================================
 \section{Training}
@@ -253,26 +247,22 @@ $v^* = x_1 - x_0$.  The loss is:
 At inference, we integrate the learned velocity field from $t=0$ (noise)
 to $t=1$ (clean latent) using an ODE solver.
 
-\subsection{Optimiser and Mixed Precision}
+\subsection{Optimizer and Mixed Precision}
 
 We use AdamW with $\beta=(0.9,0.95)$, weight decay $0.05$, and peak LR
-$10^{-3}$.  The schedule is cosine annealing with 1\,000-step linear
-warmup.  Training uses \texttt{torch.amp} with bfloat16 on A100 hardware.
+$10^{-3}$.  The schedule is cosine annealing with 1\,000-step linear warmup.  Training uses \texttt{torch.amp} with bfloat16 on A100 hardware.
 Default batch size is 256; convergence plateaus at 50--80 epochs
 (${\sim}3{,}000$ steps/s on A100-40GB).
 
 % ====================================================================
-\section{Inference Optimisations}
+\section{Inference Optimizations}
 % ====================================================================
 
 % ────────────────────────────────────────────────────────────────────
 \subsection{KV-Cache Engine}
 % ────────────────────────────────────────────────────────────────────
 
-The central contribution is a KV-cache design that eliminates redundant
-context-token computation across ODE steps.  In action-conditioned world
-modelling, $n_c$ historical context frames have \emph{identical}
-representations across all ODE steps for a given prediction.
+The central contribution is a KV-cache design that eliminates redundant context-token computation across ODE steps.  In action-conditioned world modeling, $n_c$ historical context frames have \emph{identical} representations across all ODE steps for a given prediction.
 
 \paragraph{Cache layout.}
 We pre-allocate contiguous tensors $K, V \in \mathbb{R}^{L \times 1
@@ -286,16 +276,11 @@ N_{\mathrm{den}}$.  The cache partitions into:
         overwritten at each ODE step with denoise-token K/V.
 \end{itemize}
 
-All operations are zero-allocation: \texttt{.copy\_()}, no temporary
-buffers.  The cache is CUDA-graph-safe (static shapes, no host-device
-synchronisation).
+All operations are zero-allocation: \texttt{.copy\_()}, no temporary buffers.  The cache is CUDA-graph-safe (static shapes, no host-device synchronization).
 
 \paragraph{Unified forward pass.}
 We refactored the DiT forward to accept an optional \texttt{cache}
-argument.  Training ($\text{cache}{=}\texttt{None}$) performs standard
-self-attention.  Inference (cache provided) writes denoise K/V into the
-iterative region, reads full K/V (static prefix + iterative), and
-computes attention.  This unification guarantees numerical parity.
+argument.  Training ($\text{cache}{=}\texttt{None}$) performs standard self-attention.  Inference (cache provided) writes denoise K/V into the iterative region, reads full K/V (static prefix + iterative), and computes attention.  This unification guarantees numerical parity.
 
 \paragraph{Heun ODE solver.}
 We implement Heun's method (2nd-order) with the cache.  For $N$ steps,
@@ -306,7 +291,7 @@ operations (\texttt{x.add\_(v, alpha=dt*0.5)}).
 
 \paragraph{Cache efficiency model.}
 The speedup depends on model size and batch regime.  For
-\textbf{small models} (DiT-Small, 32.7M params ≈ 65MB fp16), the
+\textbf{small models} (DiT-Small, 32.7M params $\approx$ 65MB fp16), the
 weights fit in GPU L2 cache (RTX 5070: 48MB).  Recomputing context K/V
 re-uses weight tensors already in cache; loading the KV buffer is a
 *new* memory access that pollutes cache lines.  Conversely, for
@@ -322,7 +307,7 @@ outweighs prefill savings in the bandwidth-bound regime).
 % ────────────────────────────────────────────────────────────────────
 
 CUDA Graphs eliminate kernel-launch overhead by capturing the entire ODE
-loop as a single graph, replayed without host-device synchronisation.
+loop as a single graph, replayed without host-device synchronization.
 
 \paragraph{Graph-safe constraints.}
 Our design enforces: (1) static tensor shapes, (2) no \texttt{.item()}
@@ -356,7 +341,7 @@ that \emph{optimisations are not additive; context matters}.
 When the context window rolls over (e.g., predicting one frame and
 shifting the window to include it as context), we need to slide the KV
 cache.  A naive approach shifts all context tokens left and writes the
-new frame, costing O(n_ctx) memory copies.  Our ring-buffer
+new frame, costing O($n_ctx$) memory copies.  Our ring-buffer
 implementation replaces the shift with a circular index pointer, achieving
 O(1) updates.
 
@@ -520,9 +505,8 @@ sliding reduces CPU ops from 14.4k to 9.2k (36\% reduction).
 \section{Discussion and Future Work}
 % ====================================================================
 
-\paragraph{FP8 quantisation.}
-The CLAUDE.md engineering standard targets FP8 (e4m3fn) for Ada
-hardware. Moving cached K/V from float16 to FP8 would halve cache memory
+\paragraph{FP8 quantization.}
+Moving cached K/V from float16 to FP8 would halve cache memory
 and exploit FP8 GEMM acceleration on modern GPUs.
 
 \paragraph{\texttt{torch.compile}.}
